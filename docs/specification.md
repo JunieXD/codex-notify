@@ -17,6 +17,18 @@ Codex transcript/error watcher -> codex-notify watch
 No application server, relay, analytics service, or shared database is part of
 the product.
 
+### Current M1 implementation
+
+M1 implements normal completion cards end to end: Feishu authentication,
+secure secret storage, Card JSON 2.0 rendering, prompt state capture,
+conversation-title lookup, duration formatting, existing-notifier chaining,
+backup, and reversible uninstall.
+
+M2 is intentionally not implemented yet. It will add terminal-error
+transcript monitoring, Stop fallback handling, deduplication, LaunchAgent
+installation, and Windows Task Scheduler integration. Until then, the watch
+command reports that error monitoring is unavailable.
+
 ## 2. Product Goals
 
 1. Make it obvious from a phone notification whether a Codex task completed or
@@ -45,9 +57,9 @@ the product.
 
 | Platform | v1 support | Background integration |
 | --- | --- | --- |
-| macOS Apple Silicon | Required | Per-user LaunchAgent |
-| macOS Intel | Required | Per-user LaunchAgent |
-| Windows x64 | Required | Per-user Task Scheduler task |
+| macOS Apple Silicon | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
+| macOS Intel | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
+| Windows x64 | Required | M1 completion dispatcher and Hook; M2 Task Scheduler |
 
 The main binary must be self-contained. End users must not need Rust, Python,
 Node.js, or a package manager after installation.
@@ -76,11 +88,14 @@ must support a documented non-interactive mode later for automation.
 4. Ask for Feishu App ID, App Secret, receiver type, and receiver identifier.
 5. Store the App Secret in the OS credential store.
 6. Write non-secret configuration.
-7. Install the completion dispatcher and the UserPromptSubmit/Stop hooks
-   without deleting unrelated user configuration.
-8. Install and start the local error watcher.
-9. Send an opt-in test notification and report its result.
-10. Run `doctor` automatically and print a concise summary.
+7. Install the completion dispatcher and UserPromptSubmit Hook without
+   deleting unrelated user configuration.
+8. Send an opt-in test notification and report its result.
+9. Explain that Codex requires the user to review and trust the new Hook.
+10. Print a concise status summary.
+
+M1 does not install a Stop Hook or local error watcher. Those changes belong
+to M2 and must use the same backup, merge, and reversibility rules.
 
 The installer must make a timestamped backup before modifying a user-managed
 Codex configuration file. It must use a TOML/JSON parser and writer, not text
