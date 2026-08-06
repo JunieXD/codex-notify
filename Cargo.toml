@@ -1,0 +1,18 @@
+[package]
+name = "codex-notify"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cross-platform local notifications for Codex, starting with Feishu."
+license = "MIT"
+repository = "https://github.com/JunieXD/codex-notify"
+readme = "README.md"
+keywords = ["codex", "feishu", "notifications", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "codex-notify"
+path = "src/main.rs"
+
+[dependencies]
+
