@@ -33,7 +33,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       ASSET_NAME: ${{ matrix.asset_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --locked --release --target "$TARGET"
