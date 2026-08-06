@@ -26,6 +26,24 @@ jobs:
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --check
+      - name: Validate macOS installer
+        if: runner.os == 'macOS'
+        run: sh -n scripts/install.sh
+      - name: Validate Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$env:GITHUB_WORKSPACE/scripts/install.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
