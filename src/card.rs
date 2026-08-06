@@ -1,4 +1,4 @@
-use crate::model::{Notification, format_duration};
+use crate::model::{Notification, Outcome, format_duration};
 use serde_json::{Value, json};
 
 pub const MAX_CARD_CONTENT_BYTES: usize = 28_000;
@@ -90,8 +90,12 @@ fn card_value(
     task: &str,
     details: &str,
 ) -> Value {
+    let details_label = match notification.outcome {
+        Outcome::Completed => "\u{7ed3}\u{679c}",
+        Outcome::Interrupted => "\u{5f02}\u{5e38}\u{8be6}\u{60c5}",
+    };
     let markdown_content =
-        format!("**\u{4efb}\u{52a1}**\n{task}\n\n**\u{7ed3}\u{679c}**\n{details}");
+        format!("**\u{4efb}\u{52a1}**\n{task}\n\n**{details_label}**\n{details}");
 
     json!({
         "schema": "2.0",
@@ -221,7 +225,7 @@ fn utf8_prefix(value: &str, maximum_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{MAX_CARD_CONTENT_BYTES, render, shorten_utf8};
-    use crate::model::Notification;
+    use crate::model::{Notification, Outcome};
     use std::time::Duration;
 
     fn completion() -> Notification {
@@ -270,5 +274,24 @@ mod tests {
     #[test]
     fn utf8_truncation_never_breaks_a_character() {
         assert_eq!(shorten_utf8("\u{4f60}\u{597d}", 4), "\u{4f60}");
+    }
+
+    #[test]
+    fn interruption_cards_use_the_same_collapsed_layout_with_warning_title() {
+        let notification = Notification::interrupted(
+            "\u{5bfc}\u{5165}\u{901a}\u{77e5}",
+            "\u{5b9e}\u{73b0}\u{76d1}\u{63a7}",
+            "**\u{9519}\u{8bef}**\nstream disconnected",
+            Some(Duration::from_secs(31)),
+            "error-1",
+        );
+        let card = render(&notification);
+        assert_eq!(notification.outcome, Outcome::Interrupted);
+        assert!(card.outer_title.starts_with("\u{26a0}\u{fe0f}"));
+        assert!(
+            card.serialized_content
+                .contains("\u{5f02}\u{5e38}\u{8be6}\u{60c5}")
+        );
+        assert_eq!(card.value["body"]["elements"][0]["expanded"], false);
     }
 }

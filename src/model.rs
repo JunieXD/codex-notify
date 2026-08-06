@@ -61,6 +61,25 @@ impl Notification {
             occurred_at: SystemTime::now(),
         }
     }
+
+    pub fn interrupted(
+        conversation_title: impl Into<String>,
+        task: impl Into<String>,
+        details_markdown: impl Into<String>,
+        elapsed: Option<Duration>,
+        event_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: Outcome::Interrupted,
+            conversation_title: conversation_title.into(),
+            task: task.into(),
+            details_markdown: details_markdown.into(),
+            elapsed,
+            workspace: None,
+            event_id: event_id.into(),
+            occurred_at: SystemTime::now(),
+        }
+    }
 }
 
 pub fn format_duration(duration: Duration) -> String {

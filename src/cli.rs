@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use serde_json::json;
@@ -6,20 +6,23 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use crate::codex::{
-    CompletionEvent, PromptHookEvent, RestoreNotifyResult, backup_file, completion_notification,
-    has_prompt_hook, install_integration, read_notify_command, record_prompt_context,
-    remove_completion_state, remove_prompt_hook, restore_notify_command, rollback_integration,
-    run_previous_notifier,
+    CompletionEvent, PromptHookEvent, RestoreNotifyResult, StopHookEvent, backup_file,
+    completion_notification, has_prompt_hook, has_stop_hook, install_integration,
+    read_notify_command, record_prompt_context, remove_completion_state, remove_prompt_hook,
+    remove_stop_hook, restore_notify_command, rollback_integration, run_previous_notifier,
 };
 use crate::diagnostics;
 use crate::feishu::FeishuClient;
 use crate::model::Notification;
+use crate::monitor;
 use crate::paths::AppPaths;
+use crate::platform;
 use crate::secrets::{KeyringSecretStore, SecretStore};
-use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
+use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType, atomic_write};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,8 +47,8 @@ enum Commands {
     Doctor(JsonOutput),
     /// Restore the previous Codex notifier and remove codex-notify integration.
     Uninstall(UninstallArgs),
-    /// M2 transcript error watcher.
-    Watch,
+    /// Run the local terminal-error watcher.
+    Watch(WatchArgs),
     #[command(hide = true)]
     Notify {
         /// The single JSON argument supplied by Codex notify.
@@ -53,6 +56,8 @@ enum Commands {
     },
     #[command(name = "prompt-hook", hide = true)]
     PromptHook,
+    #[command(name = "stop-hook", hide = true)]
+    StopHook,
 }
 
 #[derive(Debug, Args)]
@@ -94,6 +99,13 @@ struct UninstallArgs {
     yes: bool,
 }
 
+#[derive(Debug, Args)]
+struct WatchArgs {
+    /// Scan once and exit instead of running the background loop.
+    #[arg(long)]
+    once: bool,
+}
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -102,11 +114,10 @@ pub fn run() -> ExitCode {
         Commands::Status(arguments) => status(arguments.json),
         Commands::Doctor(arguments) => doctor(arguments.json),
         Commands::Uninstall(arguments) => uninstall(arguments),
-        Commands::Watch => Err(anyhow!(
-            "watch is planned for M2; completion notifications are available now"
-        )),
+        Commands::Watch(arguments) => watch(arguments),
         Commands::Notify { event_json } => notify(event_json),
         Commands::PromptHook => prompt_hook(),
+        Commands::StopHook => stop_hook(),
     };
 
     match result {
@@ -121,6 +132,7 @@ pub fn run() -> ExitCode {
 fn init(arguments: InitArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let existing = AppConfig::load(&paths)?;
+    let original_app_config = read_optional_file(&paths.config)?;
     let app_id = input_value(
         arguments.app_id,
         existing
@@ -153,6 +165,7 @@ fn init(arguments: InitArgs) -> Result<()> {
     println!("  - {}", paths.codex_config().display());
     println!("  - {}", paths.codex_hooks().display());
     println!("  - {}", paths.config.display());
+    println!("  - {}", platform::watcher_location()?);
     println!("The existing Codex notify command will be preserved and invoked first.");
     if !arguments.yes
         && !Confirm::new()
@@ -188,6 +201,12 @@ fn init(arguments: InitArgs) -> Result<()> {
         restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
         return Err(error);
     }
+    if let Err(error) = platform::install_watcher(&paths, &binary) {
+        let _ = rollback_integration(&paths, &setup);
+        let _ = restore_optional_file(&paths.config, original_app_config.as_deref());
+        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
+        return Err(error);
+    }
 
     if let Some(old_config) = existing
         .as_ref()
@@ -214,6 +233,7 @@ fn init(arguments: InitArgs) -> Result<()> {
         println!("Hooks backup: {}", path.display());
     }
     println!("Open /hooks in Codex and trust the new UserPromptSubmit hook before use.");
+    println!("Open /hooks in Codex and trust the new Stop hook before use.");
 
     let should_test = !arguments.skip_test
         && (arguments.yes
@@ -289,6 +309,8 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
         })
         .unwrap_or(false);
     let hook_status = has_prompt_hook(&paths.codex_hooks())?;
+    let stop_hook_status = has_stop_hook(&paths.codex_hooks())?;
+    let watcher_status = platform::is_watcher_installed(paths)?;
 
     Ok(json!({
         "configured": config.is_some(),
@@ -297,6 +319,9 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
         "credential_store": secret_status,
         "codex_notify_installed": notifier_status,
         "prompt_hook_installed": hook_status,
+        "stop_hook_installed": stop_hook_status,
+        "background_watcher_installed": watcher_status,
+        "watch_interval_seconds": monitor::WATCH_INTERVAL.as_secs(),
         "feishu_receiver_id_type": config.map(|config| config.feishu.receiver_id_type.as_api_value()),
     }))
 }
@@ -314,12 +339,21 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     let secret = data["credential_store"].as_str().unwrap_or("unavailable");
     let notifier = data["codex_notify_installed"].as_bool().unwrap_or(false);
     let hook = data["prompt_hook_installed"].as_bool().unwrap_or(false);
+    let stop_hook = data["stop_hook_installed"].as_bool().unwrap_or(false);
+    let watcher = data["background_watcher_installed"]
+        .as_bool()
+        .unwrap_or(false);
     println!("Configured: {}", yes_no(configured));
     println!("Credential store: {secret}");
     println!("Codex notify dispatcher: {}", yes_no(notifier));
     println!("UserPromptSubmit hook: {}", yes_no(hook));
+    println!("Stop hook: {}", yes_no(stop_hook));
+    println!("Background watcher: {}", yes_no(watcher));
     if include_guidance && hook {
-        println!("Hook trust: inspect and trust it with /hooks in Codex.");
+        println!("Hook trust: inspect and trust both hooks with /hooks in Codex.");
+        println!(
+            "Error detection is best-effort because Codex transcripts are not a stable Hook API."
+        );
     }
 }
 
@@ -339,17 +373,21 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
 
     let config_path = PathBuf::from(&config.installation.codex_config_path);
     let hooks_path = PathBuf::from(&config.installation.codex_hooks_path);
+    let active_notify = read_notify_command(&config_path)?;
+    if active_notify.as_deref() != Some(config.installation.managed_notify.as_slice()) {
+        bail!(
+            "the active Codex notify command is no longer owned by codex-notify; no files were removed"
+        );
+    }
+    platform::uninstall_watcher(&paths)?;
     let _ = backup_file(&paths, &config_path, "uninstall-config")?;
     let _ = backup_file(&paths, &hooks_path, "uninstall-hooks")?;
     match restore_notify_command(&config_path, &config.installation)? {
         RestoreNotifyResult::Restored => {}
-        RestoreNotifyResult::NotOwned => {
-            bail!(
-                "the active Codex notify command is no longer owned by codex-notify; no files were removed"
-            );
-        }
+        RestoreNotifyResult::NotOwned => unreachable!("ownership was checked before uninstall"),
     }
     let _ = remove_prompt_hook(&hooks_path)?;
+    let _ = remove_stop_hook(&hooks_path)?;
     let _ = KeyringSecretStore.delete_feishu_secret(&config.feishu);
     let _ = fs::remove_file(&paths.config);
     if paths.state.exists() {
@@ -386,6 +424,12 @@ fn notify(event_json: String) -> Result<()> {
     if !event.is_completion() || event.is_internal() {
         return Ok(());
     }
+    if monitor::mark_turn_completed(&paths, &event.turn_id).is_err() {
+        diagnostics::record(
+            &paths,
+            "could not cancel pending interruption after normal completion",
+        );
+    }
 
     let result: Result<()> = (|| {
         let notification = completion_notification(&paths, &event)?;
@@ -416,6 +460,98 @@ fn prompt_hook() -> Result<()> {
     }
     println!("{{}}");
     Ok(())
+}
+
+fn stop_hook() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("could not read Codex Stop Hook input")?;
+    match serde_json::from_str::<StopHookEvent>(&input) {
+        Ok(event) if event.last_assistant_message.trim().is_empty() => {
+            let transcript_path = (!event.transcript_path.trim().is_empty())
+                .then(|| PathBuf::from(event.transcript_path));
+            if monitor::record_stop_fallback(
+                &paths,
+                &event.turn_id,
+                &event.session_id,
+                &event.cwd,
+                transcript_path.as_deref(),
+                SystemTime::now(),
+            )
+            .is_err()
+            {
+                diagnostics::record(&paths, "could not record Codex Stop fallback");
+            }
+        }
+        Ok(_) => {}
+        Err(_) => diagnostics::record(&paths, "Codex Stop Hook received invalid JSON"),
+    }
+    println!("{{}}");
+    Ok(())
+}
+
+fn watch(arguments: WatchArgs) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let config = configured(&paths)?;
+    loop {
+        match watch_once(&paths, &config) {
+            Ok(delivered) if arguments.once => {
+                println!(
+                    "Watcher scan completed; delivered {delivered} interruption notification(s)."
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if arguments.once => return Err(error),
+            Err(error) => diagnostics::record(&paths, &format!("watcher scan failed: {error:#}")),
+        }
+        thread::sleep(monitor::WATCH_INTERVAL);
+    }
+}
+
+fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
+    let (_, deliveries) = monitor::prepare_notifications(paths, SystemTime::now())?;
+    if deliveries.is_empty() {
+        return Ok(0);
+    }
+    let secret = match KeyringSecretStore.get_feishu_secret(&config.feishu) {
+        Ok(secret) => secret,
+        Err(error) => {
+            for delivery in deliveries {
+                let _ = monitor::settle_delivery(paths, &delivery.key, false);
+            }
+            return Err(error);
+        }
+    };
+    let client = match FeishuClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            for delivery in deliveries {
+                let _ = monitor::settle_delivery(paths, &delivery.key, false);
+            }
+            return Err(error);
+        }
+    };
+
+    let mut delivered = 0;
+    for delivery in deliveries {
+        match client.send(&config.feishu, &secret, &delivery.notification) {
+            Ok(_) => {
+                monitor::settle_delivery(paths, &delivery.key, true)?;
+                delivered += 1;
+            }
+            Err(error) => {
+                let _ = monitor::settle_delivery(paths, &delivery.key, false);
+                diagnostics::record(
+                    paths,
+                    &format!("Feishu interruption notification failed: {error:#}"),
+                );
+            }
+        }
+    }
+    Ok(delivered)
 }
 
 fn configured(paths: &AppPaths) -> Result<AppConfig> {
@@ -511,4 +647,25 @@ fn looks_like_feishu_notifier(command: &[String]) -> bool {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn read_optional_file(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+    }
+}
+
+fn restore_optional_file(path: &std::path::Path, contents: Option<&[u8]>) -> Result<()> {
+    match contents {
+        Some(contents) => atomic_write(path, contents),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("could not remove {}", path.display()))
+            }
+        },
+    }
 }

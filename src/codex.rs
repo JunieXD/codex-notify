@@ -16,6 +16,7 @@ use crate::state::{
 };
 
 pub const PROMPT_HOOK_MARKER: &str = "codex-notify: record task context";
+pub const STOP_HOOK_MARKER: &str = "codex-notify: record interruption fallback";
 const INTERNAL_TURN_MARKERS: &[&str] = &[
     "generate 0 to 3 hyperpersonalized suggestions for what this user can do with codex",
     "codex ambient suggestions",
@@ -87,6 +88,20 @@ pub struct PromptHookEvent {
     pub prompt: String,
     #[serde(default, deserialize_with = "string_or_empty")]
     pub cwd: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StopHookEvent {
+    #[serde(default, deserialize_with = "string_or_empty")]
+    pub turn_id: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
+    pub session_id: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
+    pub cwd: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
+    pub transcript_path: String,
+    #[serde(default, deserialize_with = "string_or_empty")]
+    pub last_assistant_message: String,
 }
 
 pub fn record_prompt_context(paths: &AppPaths, event: &PromptHookEvent) -> Result<bool> {
@@ -204,6 +219,35 @@ pub fn remove_notify_command(config_path: &Path) -> Result<()> {
 }
 
 pub fn install_prompt_hook(hooks_path: &Path, binary: &Path) -> Result<bool> {
+    install_hook(
+        hooks_path,
+        "UserPromptSubmit",
+        PROMPT_HOOK_MARKER,
+        prompt_hook_command(binary),
+        prompt_hook_command_windows(binary),
+        10,
+    )
+}
+
+pub fn install_stop_hook(hooks_path: &Path, binary: &Path) -> Result<bool> {
+    install_hook(
+        hooks_path,
+        "Stop",
+        STOP_HOOK_MARKER,
+        stop_hook_command(binary),
+        stop_hook_command_windows(binary),
+        10,
+    )
+}
+
+fn install_hook(
+    hooks_path: &Path,
+    event_name: &str,
+    marker: &str,
+    command: String,
+    command_windows: String,
+    timeout: u64,
+) -> Result<bool> {
     let mut document = read_hooks_document(hooks_path)?;
     let root = document
         .as_object_mut()
@@ -214,22 +258,25 @@ pub fn install_prompt_hook(hooks_path: &Path, binary: &Path) -> Result<bool> {
         .as_object_mut()
         .context("Codex hooks.json hooks value must be a JSON object")?;
     let groups = hooks
-        .entry("UserPromptSubmit")
+        .entry(event_name)
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .context("Codex UserPromptSubmit hooks must be an array")?;
+        .with_context(|| format!("Codex {event_name} hooks must be an array"))?;
 
-    if groups.iter().any(group_contains_managed_hook) {
+    if groups
+        .iter()
+        .any(|group| group_contains_marker(group, marker))
+    {
         return Ok(false);
     }
 
     groups.push(json!({
         "hooks": [{
             "type": "command",
-            "command": prompt_hook_command(binary),
-            "commandWindows": prompt_hook_command_windows(binary),
-            "timeout": 10,
-            "statusMessage": PROMPT_HOOK_MARKER,
+            "command": command,
+            "commandWindows": command_windows,
+            "timeout": timeout,
+            "statusMessage": marker,
         }],
     }));
     write_hooks_document(hooks_path, &document)?;
@@ -237,16 +284,36 @@ pub fn install_prompt_hook(hooks_path: &Path, binary: &Path) -> Result<bool> {
 }
 
 pub fn has_prompt_hook(hooks_path: &Path) -> Result<bool> {
+    has_hook(hooks_path, "UserPromptSubmit", PROMPT_HOOK_MARKER)
+}
+
+pub fn has_stop_hook(hooks_path: &Path) -> Result<bool> {
+    has_hook(hooks_path, "Stop", STOP_HOOK_MARKER)
+}
+
+fn has_hook(hooks_path: &Path, event_name: &str, marker: &str) -> Result<bool> {
     let document = read_hooks_document(hooks_path)?;
     let groups = document
         .get("hooks")
         .and_then(Value::as_object)
-        .and_then(|hooks| hooks.get("UserPromptSubmit"))
+        .and_then(|hooks| hooks.get(event_name))
         .and_then(Value::as_array);
-    Ok(groups.is_some_and(|groups| groups.iter().any(group_contains_managed_hook)))
+    Ok(groups.is_some_and(|groups| {
+        groups
+            .iter()
+            .any(|group| group_contains_marker(group, marker))
+    }))
 }
 
 pub fn remove_prompt_hook(hooks_path: &Path) -> Result<bool> {
+    remove_hook(hooks_path, "UserPromptSubmit", PROMPT_HOOK_MARKER)
+}
+
+pub fn remove_stop_hook(hooks_path: &Path) -> Result<bool> {
+    remove_hook(hooks_path, "Stop", STOP_HOOK_MARKER)
+}
+
+fn remove_hook(hooks_path: &Path, event_name: &str, marker: &str) -> Result<bool> {
     if !hooks_path.exists() {
         return Ok(false);
     }
@@ -260,10 +327,7 @@ pub fn remove_prompt_hook(hooks_path: &Path) -> Result<bool> {
         let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
             return Ok(false);
         };
-        let Some(groups) = hooks
-            .get_mut("UserPromptSubmit")
-            .and_then(Value::as_array_mut)
-        else {
+        let Some(groups) = hooks.get_mut(event_name).and_then(Value::as_array_mut) else {
             return Ok(false);
         };
 
@@ -273,7 +337,7 @@ pub fn remove_prompt_hook(hooks_path: &Path) -> Result<bool> {
             let mut remove_group = false;
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 let old_handler_count = handlers.len();
-                handlers.retain(|handler| !is_managed_hook(handler));
+                handlers.retain(|handler| !handler_has_marker(handler, marker));
                 if handlers.len() != old_handler_count {
                     changed = true;
                 }
@@ -285,7 +349,7 @@ pub fn remove_prompt_hook(hooks_path: &Path) -> Result<bool> {
         }
         *groups = retained_groups;
         if groups.is_empty() {
-            hooks.remove("UserPromptSubmit");
+            hooks.remove(event_name);
         }
     }
 
@@ -382,6 +446,10 @@ pub fn install_integration(
             remove_prompt_hook(&hooks_path)?;
         }
         install_prompt_hook(&hooks_path, binary)?;
+        if has_stop_hook(&hooks_path)? {
+            remove_stop_hook(&hooks_path)?;
+        }
+        install_stop_hook(&hooks_path, binary)?;
         Ok(())
     })();
 
@@ -398,6 +466,7 @@ pub fn install_integration(
             codex_config_path: config_path.to_string_lossy().into_owned(),
             codex_hooks_path: hooks_path.to_string_lossy().into_owned(),
             prompt_hook_marker: PROMPT_HOOK_MARKER.to_owned(),
+            stop_hook_marker: STOP_HOOK_MARKER.to_owned(),
         },
         config_backup,
         hooks_backup,
@@ -505,15 +574,19 @@ fn write_hooks_document(path: &Path, document: &Value) -> Result<()> {
     atomic_write(path, &contents)
 }
 
-fn group_contains_managed_hook(group: &Value) -> bool {
+fn group_contains_marker(group: &Value, marker: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
-        .is_some_and(|handlers| handlers.iter().any(is_managed_hook))
+        .is_some_and(|handlers| {
+            handlers
+                .iter()
+                .any(|handler| handler_has_marker(handler, marker))
+        })
 }
 
-fn is_managed_hook(handler: &Value) -> bool {
-    handler.get("statusMessage").and_then(Value::as_str) == Some(PROMPT_HOOK_MARKER)
+fn handler_has_marker(handler: &Value, marker: &str) -> bool {
+    handler.get("statusMessage").and_then(Value::as_str) == Some(marker)
 }
 
 fn prompt_hook_command(binary: &Path) -> String {
@@ -526,6 +599,15 @@ fn prompt_hook_command(binary: &Path) -> String {
 fn prompt_hook_command_windows(binary: &Path) -> String {
     let path = binary.to_string_lossy().replace('\'', "''");
     format!("& '{path}' prompt-hook")
+}
+
+fn stop_hook_command(binary: &Path) -> String {
+    format!("{} stop-hook", shell_quote_posix(&binary.to_string_lossy()))
+}
+
+fn stop_hook_command_windows(binary: &Path) -> String {
+    let path = binary.to_string_lossy().replace('\'', "''");
+    format!("& '{path}' stop-hook")
 }
 
 fn shell_quote_posix(value: &str) -> String {
@@ -566,9 +648,9 @@ fn nonempty_path(primary: &str, fallback: &str) -> Option<PathBuf> {
 mod tests {
     use super::{
         CompletionEvent, PROMPT_HOOK_MARKER, PromptHookEvent, completion_notification,
-        has_prompt_hook, install_integration, install_prompt_hook, is_internal_prompt,
-        read_notify_command, record_prompt_context, remove_prompt_hook, rollback_integration,
-        set_notify_command,
+        has_prompt_hook, has_stop_hook, install_integration, install_prompt_hook,
+        install_stop_hook, is_internal_prompt, read_notify_command, record_prompt_context,
+        remove_prompt_hook, remove_stop_hook, rollback_integration, set_notify_command,
     };
     use crate::paths::AppPaths;
     use std::fs;
@@ -644,6 +726,29 @@ mod tests {
         assert!(contents.contains("keep-me"));
         assert!(contents.contains("other"));
         assert!(!contents.contains(PROMPT_HOOK_MARKER));
+    }
+
+    #[test]
+    fn stop_hook_merge_and_removal_leave_unrelated_hooks_intact() {
+        let directory = tempdir().expect("temporary directory");
+        let hooks_path = directory.path().join("hooks.json");
+        fs::write(
+            &hooks_path,
+            r#"{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "keep-stop"}]}]
+  }
+}"#,
+        )
+        .expect("write hooks");
+
+        assert!(install_stop_hook(&hooks_path, Path::new("/tmp/codex-notify")).expect("install"));
+        assert!(has_stop_hook(&hooks_path).expect("has hook"));
+        assert!(remove_stop_hook(&hooks_path).expect("remove"));
+
+        let contents = fs::read_to_string(&hooks_path).expect("read hooks");
+        assert!(contents.contains("keep-stop"));
+        assert!(!contents.contains("codex-notify: record interruption fallback"));
     }
 
     #[test]
@@ -735,6 +840,7 @@ mod tests {
             Some(vec!["/tmp/codex-notify".to_owned(), "notify".to_owned()])
         );
         assert!(has_prompt_hook(&paths.codex_hooks()).expect("has prompt hook"));
+        assert!(has_stop_hook(&paths.codex_hooks()).expect("has Stop hook"));
         assert!(setup.config_backup.is_some());
         rollback_integration(&paths, &setup).expect("rollback");
         assert_eq!(

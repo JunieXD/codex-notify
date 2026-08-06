@@ -116,6 +116,8 @@ pub struct InstallationConfig {
     pub codex_config_path: String,
     pub codex_hooks_path: String,
     pub prompt_hook_marker: String,
+    #[serde(default = "default_stop_hook_marker")]
+    pub stop_hook_marker: String,
 }
 
 impl InstallationConfig {
@@ -126,8 +128,15 @@ impl InstallationConfig {
         if self.prompt_hook_marker.trim().is_empty() {
             bail!("managed prompt Hook marker is missing");
         }
+        if self.stop_hook_marker.trim().is_empty() {
+            bail!("managed Stop Hook marker is missing");
+        }
         Ok(())
     }
+}
+
+fn default_stop_hook_marker() -> String {
+    "codex-notify: record interruption fallback".to_owned()
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -187,6 +196,7 @@ mod tests {
                 codex_config_path: "/tmp/config.toml".to_owned(),
                 codex_hooks_path: "/tmp/hooks.json".to_owned(),
                 prompt_hook_marker: "codex-notify: record task context".to_owned(),
+                stop_hook_marker: "codex-notify: record interruption fallback".to_owned(),
             },
         );
 
@@ -194,5 +204,24 @@ mod tests {
         let contents = std::fs::read_to_string(&paths.config).expect("read config");
         assert!(!contents.contains("app_secret"));
         assert_eq!(AppConfig::load(&paths).expect("load config"), Some(config));
+    }
+
+    #[test]
+    fn m1_installation_config_defaults_the_new_stop_hook_marker() {
+        let installation: InstallationConfig = toml_edit::de::from_str(
+            r#"
+previous_notify = ["old-notifier"]
+managed_notify = ["codex-notify", "notify"]
+codex_config_path = "/tmp/config.toml"
+codex_hooks_path = "/tmp/hooks.json"
+prompt_hook_marker = "codex-notify: record task context"
+"#,
+        )
+        .expect("parse M1 installation config");
+
+        assert_eq!(
+            installation.stop_hook_marker,
+            "codex-notify: record interruption fallback"
+        );
     }
 }

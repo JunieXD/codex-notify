@@ -17,17 +17,18 @@ Codex transcript/error watcher -> codex-notify watch
 No application server, relay, analytics service, or shared database is part of
 the product.
 
-### Current M1 implementation
+### Current M2 implementation
 
-M1 implements normal completion cards end to end: Feishu authentication,
-secure secret storage, Card JSON 2.0 rendering, prompt state capture,
+M1 completion cards are implemented end to end: Feishu authentication, secure
+secret storage, Card JSON 2.0 rendering, prompt state capture,
 conversation-title lookup, duration formatting, existing-notifier chaining,
 backup, and reversible uninstall.
 
-M2 is intentionally not implemented yet. It will add terminal-error
-transcript monitoring, Stop fallback handling, deduplication, LaunchAgent
-installation, and Windows Task Scheduler integration. Until then, the watch
-command reports that error monitoring is unavailable.
+M2 terminal-error monitoring is also implemented. It uses incremental JSONL
+offsets, a durable two-stage confirmation state, transcript and Stop Hook
+deduplication, a macOS per-user LaunchAgent, and a Windows per-user Task
+Scheduler task. It is explicitly best-effort because transcript JSONL is not a
+stable Codex extension interface.
 
 ## 2. Product Goals
 
@@ -88,14 +89,17 @@ must support a documented non-interactive mode later for automation.
 4. Ask for Feishu App ID, App Secret, receiver type, and receiver identifier.
 5. Store the App Secret in the OS credential store.
 6. Write non-secret configuration.
-7. Install the completion dispatcher and UserPromptSubmit Hook without
+7. Install the completion dispatcher, UserPromptSubmit Hook, and Stop Hook without
    deleting unrelated user configuration.
-8. Send an opt-in test notification and report its result.
-9. Explain that Codex requires the user to review and trust the new Hook.
-10. Print a concise status summary.
+8. Install the platform background watcher without administrator privileges.
+9. Send an opt-in test notification and report its result.
+10. Explain that Codex requires the user to review and trust the new Hooks.
+11. Print a concise status summary.
 
-M1 does not install a Stop Hook or local error watcher. Those changes belong
-to M2 and must use the same backup, merge, and reversibility rules.
+The Stop Hook never sends an interruption card immediately. It only creates a
+pending candidate, which the watcher confirms using the same rules as a
+transcript error. This prevents a normal completion from racing a fallback
+notification.
 
 The installer must make a timestamped backup before modifying a user-managed
 Codex configuration file. It must use a TOML/JSON parser and writer, not text
@@ -252,7 +256,23 @@ message, including examples such as:
 An exact known usage-limit terminal message is also recognized if a provider
 surfaces it as the only final message rather than in an error field.
 
-### 8.2 Limitations
+### 8.2 Two-stage confirmation
+
+On discovery, a terminal error is written to durable `confirming` state rather
+than sent immediately. The watcher scans the rest of the same transcript before
+making any decision, then scans only later bytes on subsequent passes.
+
+- Ordinary turns notify only after 30 seconds without a later `task_started`.
+- Any later `task_started` cancels the candidate because a reconnect, manual
+  continuation, or Goal continuation started work again.
+- If the Goal was `active` at the error, the candidate is not notified for an
+  individual failed turn. `complete` and `paused` cancel it; `blocked`,
+  `usage_limited`, and `budget_limited` notify it; otherwise it becomes due
+  after 10 minutes of silence.
+- A Stop Hook with no final assistant message creates the same kind of pending
+  candidate. A documented normal completion cancels candidates for its turn.
+
+### 8.3 Limitations
 
 Codex transcript format is not a stable public hook interface. The watcher is
 therefore best-effort and must isolate parsing behind a `TranscriptSource`
@@ -262,7 +282,7 @@ The tool cannot guarantee an alert if Codex, the binary, or the operating
 system is terminated before a terminal record is written. It must surface this
 limitation in `doctor` and documentation.
 
-### 8.3 Deduplication
+### 8.4 Deduplication
 
 Each terminal event has a stable digest built from its turn ID, completion
 timestamp, and normalized error message. The watcher persists a bounded set of
@@ -352,21 +372,26 @@ not include App Secrets, access tokens, or unredacted authorization headers.
 
 ### 12.1 macOS
 
-`init` installs a per-user LaunchAgent. It runs `codex-notify watch` at login,
-restarts it after an unexpected exit, and writes logs to the application data
-directory. No administrator privileges are required.
+`init` installs a per-user LaunchAgent at
+`~/Library/LaunchAgents/com.codex-notify.watcher.plist`. It runs
+`codex-notify watch` at login, keeps it alive after an unexpected exit, and
+uses the capped application diagnostics log rather than unbounded service
+stdout/stderr logs. No administrator privileges are required.
 
 ### 12.2 Windows
 
-`init` creates a per-user Task Scheduler task triggered at logon. The task runs
-`codex-notify watch`, restarts on failure, and does not require a system-wide
-service or administrator privileges.
+`init` creates a per-user `Codex Notify Watcher` Task Scheduler task triggered
+at logon. The task runs `codex-notify watch`, ignores overlapping instances,
+restarts after failure, and does not require a system-wide service or
+administrator privileges.
 
 ### 12.3 Watcher behavior
 
-The watcher is a low-resource long-running process. It uses offsets instead of
-re-reading full JSONL files, sleeps while idle, limits memory use, and handles
-file rotation or truncation safely.
+The watcher is a low-resource long-running process. It scans immediately and
+then sleeps for 30 seconds, uses offsets instead of re-reading full JSONL
+files, looks only in session directories around the current day plus recently
+modified archived files, limits persistent candidate state, and handles file
+rotation or truncation safely.
 
 ## 13. Security and Privacy
 
@@ -491,10 +516,9 @@ upgrade, signing, and compatibility behavior are stable.
 
 ### M2: Error watcher
 
-- Incremental transcript watcher.
-- macOS LaunchAgent and Windows Task Scheduler integration.
-- Stream-disconnect and usage-limit fixtures.
-- `doctor` and deduplication.
+- Implemented: incremental transcript watcher, two-stage confirmation, Stop
+  fallback handling, macOS LaunchAgent and Windows Task Scheduler integration,
+  stream-disconnect and usage-limit fixtures, `doctor`, and deduplication.
 
 ### M3: Distribution hardening
 
