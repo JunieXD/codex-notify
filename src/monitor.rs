@@ -634,10 +634,10 @@ fn interruption_notification(
             })
         });
     let details = if cwd.is_empty() {
-        format!("**\u{9519}\u{8bef}**\n{}", candidate.error_message)
+        format!("\u{9519}\u{8bef}\u{ff1a}{}", candidate.error_message)
     } else {
         format!(
-            "**\u{9519}\u{8bef}**\n{}\n\n**\u{5de5}\u{4f5c}\u{76ee}\u{5f55}**\n`{cwd}`",
+            "\u{9519}\u{8bef}\u{ff1a}{}\n\u{5de5}\u{4f5c}\u{76ee}\u{5f55}\u{ff1a}{cwd}",
             candidate.error_message
         )
     };

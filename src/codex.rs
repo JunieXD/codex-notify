@@ -22,6 +22,10 @@ const INTERNAL_TURN_MARKERS: &[&str] = &[
     "codex ambient suggestions",
     "you will be presented with a user prompt, and your job is to provide a short title for a task",
 ];
+const INTERNAL_TURN_SIGNATURES: &[&[&str]] = &[&[
+    "fill the structured description field with a compact, search-oriented summary",
+    "this is a keyword retrieval index, not a broad prose summary",
+]];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionEvent {
@@ -177,6 +181,9 @@ pub fn is_internal_prompt(prompt: &str) -> bool {
     INTERNAL_TURN_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
+        || INTERNAL_TURN_SIGNATURES
+            .iter()
+            .any(|signature| signature.iter().all(|marker| normalized.contains(marker)))
 }
 
 pub fn managed_notify_command(binary: &Path) -> Vec<String> {
@@ -792,6 +799,13 @@ mod tests {
     fn known_ambient_turns_are_filtered() {
         assert!(is_internal_prompt(
             "Generate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex"
+        ));
+        assert!(is_internal_prompt(
+            "Fill the structured description field with a compact, search-oriented summary. \
+             This is a keyword retrieval index, not a broad prose summary."
+        ));
+        assert!(!is_internal_prompt(
+            "Fill the structured description field with a compact, search-oriented summary."
         ));
         assert!(!is_internal_prompt("Implement the notification provider"));
     }

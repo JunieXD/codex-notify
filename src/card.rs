@@ -1,4 +1,5 @@
-use crate::model::{Notification, Outcome, format_duration};
+use crate::model::{Notification, format_duration};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use serde_json::{Value, json};
 
 pub const MAX_CARD_CONTENT_BYTES: usize = 28_000;
@@ -14,7 +15,9 @@ pub struct RenderedCard {
 }
 
 pub fn render(notification: &Notification) -> RenderedCard {
-    let title = outer_title(notification);
+    let moment = DateTime::<Local>::from(notification.occurred_at);
+    let title = outer_title(notification, &moment);
+    let sent_at = format_sent_at(&moment);
     let heading = heading(notification);
     let task_text = normalize_text(&notification.task);
     let task = shorten_utf8(&task_text, MAX_TASK_BYTES);
@@ -22,7 +25,7 @@ pub fn render(notification: &Notification) -> RenderedCard {
     let details = shorten_utf8(&details_text, MAX_DETAILS_BYTES);
 
     let (task, details, value, serialized_content) =
-        fit_card(notification, &title, &heading, task, details);
+        fit_card(notification, &title, &heading, &sent_at, task, details);
 
     debug_assert!(!task.is_empty() || !details.is_empty());
     debug_assert!(serialized_content.len() <= MAX_CARD_CONTENT_BYTES);
@@ -43,14 +46,29 @@ fn normalize_text(value: &str) -> String {
     }
 }
 
-fn outer_title(notification: &Notification) -> String {
-    let title = single_line(&notification.conversation_title, 77);
+fn outer_title(notification: &Notification, moment: &DateTime<Local>) -> String {
+    let title = single_line(&notification.conversation_title, 71);
     let title = if title.is_empty() {
         "Codex \u{4f1a}\u{8bdd}".to_owned()
     } else {
         title
     };
-    format!("{} {title}", notification.outcome.emoji())
+    format!(
+        "{} {:02}:{:02} {title}",
+        notification.outcome.emoji(),
+        moment.hour(),
+        moment.minute()
+    )
+}
+
+fn format_sent_at(moment: &DateTime<Local>) -> String {
+    format!(
+        "{}\u{6708}{}\u{65e5} {:02}:{:02}",
+        moment.month(),
+        moment.day(),
+        moment.hour(),
+        moment.minute()
+    )
 }
 
 fn heading(notification: &Notification) -> String {
@@ -87,15 +105,13 @@ fn card_value(
     notification: &Notification,
     title: &str,
     heading: &str,
+    sent_at: &str,
     task: &str,
     details: &str,
 ) -> Value {
-    let details_label = match notification.outcome {
-        Outcome::Completed => "\u{7ed3}\u{679c}",
-        Outcome::Interrupted => "\u{5f02}\u{5e38}\u{8be6}\u{60c5}",
-    };
-    let markdown_content =
-        format!("**\u{4efb}\u{52a1}**\n{task}\n\n**{details_label}**\n{details}");
+    let markdown_content = format!(
+        "**\u{53d1}\u{9001}\u{65f6}\u{95f4}** {sent_at}\n\n**\u{4efb}\u{52a1}**\n{task}\n\n**\u{7ed3}\u{679c}**\n{details}"
+    );
 
     json!({
         "schema": "2.0",
@@ -140,29 +156,30 @@ fn fit_card(
     notification: &Notification,
     title: &str,
     heading: &str,
+    sent_at: &str,
     mut task: String,
     mut details: String,
 ) -> (String, String, Value, String) {
-    let mut value = card_value(notification, title, heading, &task, &details);
+    let mut value = card_value(notification, title, heading, sent_at, &task, &details);
     let mut serialized_content = serialized(&value);
     if serialized_content.len() <= MAX_CARD_CONTENT_BYTES {
         return (task, details, value, serialized_content);
     }
 
     details = fit_text_to_card(&details, |candidate| {
-        card_value(notification, title, heading, &task, candidate)
+        card_value(notification, title, heading, sent_at, &task, candidate)
     });
-    value = card_value(notification, title, heading, &task, &details);
+    value = card_value(notification, title, heading, sent_at, &task, &details);
     serialized_content = serialized(&value);
     if serialized_content.len() <= MAX_CARD_CONTENT_BYTES {
         return (task, details, value, serialized_content);
     }
 
     task = fit_text_to_card(&task, |candidate| {
-        card_value(notification, title, heading, candidate, "")
+        card_value(notification, title, heading, sent_at, candidate, "")
     });
     details.clear();
-    value = card_value(notification, title, heading, &task, &details);
+    value = card_value(notification, title, heading, sent_at, &task, &details);
     serialized_content = serialized(&value);
 
     (task, details, value, serialized_content)
@@ -241,10 +258,18 @@ mod tests {
     #[test]
     fn outer_title_uses_status_and_conversation_title() {
         let card = render(&completion());
-        assert_eq!(
-            card.outer_title,
-            "\u{2705} \u{786e}\u{8ba4}\u{4efb}\u{52a1}\u{5b8c}\u{6210}\u{901a}\u{77e5}\u{80fd}\u{529b}"
-        );
+        assert!(card.outer_title.starts_with("\u{2705} "));
+        assert!(card.outer_title.ends_with(
+            " \u{786e}\u{8ba4}\u{4efb}\u{52a1}\u{5b8c}\u{6210}\u{901a}\u{77e5}\u{80fd}\u{529b}"
+        ));
+        let time = card
+            .outer_title
+            .strip_prefix("\u{2705} ")
+            .and_then(|value| value.split_once(' '))
+            .map(|(time, _)| time)
+            .expect("outer title time");
+        assert_eq!(time.len(), 5);
+        assert_eq!(time.as_bytes()[2], b':');
         assert!(
             !card
                 .outer_title
@@ -258,6 +283,10 @@ mod tests {
         let panel = &card.value["body"]["elements"][0];
         assert_eq!(panel["tag"], "collapsible_panel");
         assert_eq!(panel["expanded"], false);
+        assert!(
+            card.serialized_content
+                .contains("**\u{53d1}\u{9001}\u{65f6}\u{95f4}**")
+        );
         assert!(card.serialized_content.contains("**\u{4efb}\u{52a1}**"));
         assert!(card.serialized_content.contains("1h 1m 1s"));
     }
@@ -288,10 +317,7 @@ mod tests {
         let card = render(&notification);
         assert_eq!(notification.outcome, Outcome::Interrupted);
         assert!(card.outer_title.starts_with("\u{26a0}\u{fe0f}"));
-        assert!(
-            card.serialized_content
-                .contains("\u{5f02}\u{5e38}\u{8be6}\u{60c5}")
-        );
+        assert!(card.serialized_content.contains("**\u{7ed3}\u{679c}**"));
         assert_eq!(card.value["body"]["elements"][0]["expanded"], false);
     }
 }

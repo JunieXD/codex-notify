@@ -151,8 +151,8 @@ Many mobile notification trays show only the outer card title. Therefore the
 title must always have a status prefix:
 
 ```text
-Completed:   "OK <conversation title>"
-Interrupted: "WARN <conversation title>"
+Completed:   "OK HH:MM <conversation title>"
+Interrupted: "WARN HH:MM <conversation title>"
 ```
 
 The rendered Feishu v1 title uses the corresponding success or warning symbol.
@@ -166,9 +166,9 @@ If the local Codex conversation title cannot be resolved, the fallback title is
 The initial Feishu card is an interactive Card JSON 2.0 card:
 
 ```text
-Outer title:       success symbol + Codex conversation title
+Outer title:       success symbol + HH:MM + Codex conversation title
 Collapsed header:  Codex task completed + Hh Mm Ss duration
-Collapsed body:    task, then Markdown result
+Collapsed body:    local send time, task, then Markdown result
 Color:             green
 ```
 
@@ -180,14 +180,16 @@ Feishu limits.
 ### 6.4 Interruption card
 
 ```text
-Outer title:       warning symbol + Codex conversation title
+Outer title:       warning symbol + HH:MM + Codex conversation title
 Collapsed header:  Codex task interrupted + Hh Mm Ss duration
-Collapsed body:    task, then error details and workspace when available
+Collapsed body:    local send time, task, then error details and workspace
 Color:             red
 ```
 
-Completion and interruption cards must use the same title, duration, collapse,
-and Markdown conventions.
+Completion and interruption cards use the same title, duration, collapse, and
+Markdown conventions. The mobile-visible outer title is
+`<status emoji> HH:MM <conversation title>`, and the collapsed Markdown body
+starts with the local send date and time.
 
 ## 7. Codex Integration
 

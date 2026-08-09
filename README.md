@@ -10,11 +10,14 @@ the Codex integration.
 M2 is implemented:
 
 - Feishu tenant-token authentication and interactive Card JSON 2.0 delivery.
-- A mobile-visible outer title with a success emoji and the Codex conversation
-  title.
+- A mobile-visible outer title with status, send time, and the Codex
+  conversation title.
 - A collapsed card body containing the original task and full Markdown result.
+- The local send date and time at the top of the collapsed card body.
 - Elapsed time formatted as hours, minutes, and seconds.
 - UserPromptSubmit state capture for the task, title, and start time.
+- Known Codex desktop ambient, title, and retrieval-index turns are suppressed
+  across prompt capture, completion delivery, and interruption monitoring.
 - A Stop Hook fallback that records, rather than immediately sends, a missing
   final-result event.
 - An incremental transcript watcher for `task_complete.error`, including

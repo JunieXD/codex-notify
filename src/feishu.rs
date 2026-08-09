@@ -254,10 +254,11 @@ mod tests {
             let card: serde_json::Value =
                 serde_json::from_str(request_body["content"].as_str().expect("card content"))
                     .expect("card JSON");
-            assert_eq!(
-                card["header"]["title"]["content"],
-                "\u{2705} Test conversation"
-            );
+            let title = card["header"]["title"]["content"]
+                .as_str()
+                .expect("card title");
+            assert!(title.starts_with("\u{2705} "));
+            assert!(title.ends_with(" Test conversation"));
             write_http_response(
                 &mut message_stream,
                 r#"{"code":0,"msg":"ok","data":{"message_id":"om_test"}}"#,
