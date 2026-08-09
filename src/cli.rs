@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime};
 use crate::codex::{
     CompletionEvent, PromptHookEvent, RestoreNotifyResult, StopHookEvent, backup_file,
     completion_notification, has_prompt_hook, has_stop_hook, install_integration,
-    read_notify_command, record_prompt_context, remove_completion_state, remove_prompt_hook,
-    remove_stop_hook, restore_notify_command, rollback_integration, run_previous_notifier,
+    read_notify_command, record_prompt_context, remove_completion_state,
+    remove_empty_created_codex_files, remove_prompt_hook, remove_stop_hook, restore_notify_command,
+    rollback_integration, run_previous_notifier,
 };
 use crate::diagnostics;
 use crate::feishu::FeishuClient;
@@ -388,6 +389,7 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
     }
     let _ = remove_prompt_hook(&hooks_path)?;
     let _ = remove_stop_hook(&hooks_path)?;
+    remove_empty_created_codex_files(&config_path, &hooks_path, &config.installation)?;
     let _ = KeyringSecretStore.delete_feishu_secret(&config.feishu);
     let _ = fs::remove_file(&paths.config);
     if paths.state.exists() {

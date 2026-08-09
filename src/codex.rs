@@ -320,6 +320,36 @@ pub fn remove_stop_hook(hooks_path: &Path) -> Result<bool> {
     remove_hook(hooks_path, "Stop", STOP_HOOK_MARKER)
 }
 
+pub fn remove_empty_created_codex_files(
+    config_path: &Path,
+    hooks_path: &Path,
+    installation: &InstallationConfig,
+) -> Result<()> {
+    if installation.created_codex_config && config_path.exists() {
+        let document = read_toml_document(config_path)?;
+        if document.as_table().is_empty() {
+            fs::remove_file(config_path)
+                .with_context(|| format!("could not remove {}", config_path.display()))?;
+        }
+    }
+    if installation.created_codex_hooks && hooks_path.exists() {
+        let document = read_hooks_document(hooks_path)?;
+        let empty = document.as_object().is_some_and(|root| {
+            root.is_empty()
+                || (root.len() == 1
+                    && root
+                        .get("hooks")
+                        .and_then(Value::as_object)
+                        .is_some_and(Map::is_empty))
+        });
+        if empty {
+            fs::remove_file(hooks_path)
+                .with_context(|| format!("could not remove {}", hooks_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_hook(hooks_path: &Path, event_name: &str, marker: &str) -> Result<bool> {
     if !hooks_path.exists() {
         return Ok(false);
@@ -444,6 +474,12 @@ pub fn install_integration(
 
     let original_config = read_optional_file(&config_path)?;
     let original_hooks = read_optional_file(&hooks_path)?;
+    let created_codex_config = previous_installation
+        .map(|installation| installation.created_codex_config)
+        .unwrap_or(original_config.is_none());
+    let created_codex_hooks = previous_installation
+        .map(|installation| installation.created_codex_hooks)
+        .unwrap_or(original_hooks.is_none());
     let config_backup = backup_file(paths, &config_path, "config")?;
     let hooks_backup = backup_file(paths, &hooks_path, "hooks")?;
 
@@ -474,6 +510,8 @@ pub fn install_integration(
             codex_hooks_path: hooks_path.to_string_lossy().into_owned(),
             prompt_hook_marker: PROMPT_HOOK_MARKER.to_owned(),
             stop_hook_marker: STOP_HOOK_MARKER.to_owned(),
+            created_codex_config,
+            created_codex_hooks,
         },
         config_backup,
         hooks_backup,
@@ -657,7 +695,8 @@ mod tests {
         CompletionEvent, PROMPT_HOOK_MARKER, PromptHookEvent, completion_notification,
         has_prompt_hook, has_stop_hook, install_integration, install_prompt_hook,
         install_stop_hook, is_internal_prompt, read_notify_command, record_prompt_context,
-        remove_prompt_hook, remove_stop_hook, rollback_integration, set_notify_command,
+        remove_empty_created_codex_files, remove_prompt_hook, remove_stop_hook,
+        restore_notify_command, rollback_integration, set_notify_command,
     };
     use crate::paths::AppPaths;
     use std::fs;
@@ -856,11 +895,66 @@ mod tests {
         assert!(has_prompt_hook(&paths.codex_hooks()).expect("has prompt hook"));
         assert!(has_stop_hook(&paths.codex_hooks()).expect("has Stop hook"));
         assert!(setup.config_backup.is_some());
+        assert!(!setup.installation.created_codex_config);
+        assert!(setup.installation.created_codex_hooks);
         rollback_integration(&paths, &setup).expect("rollback");
         assert_eq!(
             fs::read_to_string(paths.codex_config()).expect("restored config"),
             "notify = [\"python3\", \"/tmp/previous-notify.py\"]\n"
         );
         assert!(!paths.codex_hooks().exists());
+    }
+
+    #[test]
+    fn uninstall_removes_empty_codex_files_created_by_the_integration() {
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = paths(app_home.path(), codex_home.path());
+        let setup =
+            install_integration(&paths, Path::new("/tmp/codex-notify"), None).expect("install");
+        assert!(setup.installation.created_codex_config);
+        assert!(setup.installation.created_codex_hooks);
+
+        restore_notify_command(&paths.codex_config(), &setup.installation).expect("restore notify");
+        remove_prompt_hook(&paths.codex_hooks()).expect("remove prompt hook");
+        remove_stop_hook(&paths.codex_hooks()).expect("remove stop hook");
+        remove_empty_created_codex_files(
+            &paths.codex_config(),
+            &paths.codex_hooks(),
+            &setup.installation,
+        )
+        .expect("remove empty created files");
+
+        assert!(!paths.codex_config().exists());
+        assert!(!paths.codex_hooks().exists());
+    }
+
+    #[test]
+    fn uninstall_keeps_created_codex_files_after_the_user_adds_content() {
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = paths(app_home.path(), codex_home.path());
+        let setup =
+            install_integration(&paths, Path::new("/tmp/codex-notify"), None).expect("install");
+
+        restore_notify_command(&paths.codex_config(), &setup.installation).expect("restore notify");
+        fs::write(paths.codex_config(), "model = \"gpt-test\"\n").expect("add config");
+        remove_prompt_hook(&paths.codex_hooks()).expect("remove prompt hook");
+        remove_stop_hook(&paths.codex_hooks()).expect("remove stop hook");
+        fs::write(
+            paths.codex_hooks(),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"keep"}]}]}}"#,
+        )
+        .expect("add hook");
+
+        remove_empty_created_codex_files(
+            &paths.codex_config(),
+            &paths.codex_hooks(),
+            &setup.installation,
+        )
+        .expect("preserve user content");
+
+        assert!(paths.codex_config().exists());
+        assert!(paths.codex_hooks().exists());
     }
 }

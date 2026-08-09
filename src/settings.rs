@@ -118,6 +118,10 @@ pub struct InstallationConfig {
     pub prompt_hook_marker: String,
     #[serde(default = "default_stop_hook_marker")]
     pub stop_hook_marker: String,
+    #[serde(default)]
+    pub created_codex_config: bool,
+    #[serde(default)]
+    pub created_codex_hooks: bool,
 }
 
 impl InstallationConfig {
@@ -197,6 +201,8 @@ mod tests {
                 codex_hooks_path: "/tmp/hooks.json".to_owned(),
                 prompt_hook_marker: "codex-notify: record task context".to_owned(),
                 stop_hook_marker: "codex-notify: record interruption fallback".to_owned(),
+                created_codex_config: false,
+                created_codex_hooks: false,
             },
         );
 
@@ -223,5 +229,7 @@ prompt_hook_marker = "codex-notify: record task context"
             installation.stop_hook_marker,
             "codex-notify: record interruption fallback"
         );
+        assert!(!installation.created_codex_config);
+        assert!(!installation.created_codex_hooks);
     }
 }
