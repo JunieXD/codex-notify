@@ -26,8 +26,8 @@ backup, and reversible uninstall.
 
 M2 terminal-error monitoring is also implemented. It uses incremental JSONL
 offsets, a durable two-stage confirmation state, transcript and Stop Hook
-deduplication, a macOS per-user LaunchAgent, and a Windows per-user Task
-Scheduler task. It is explicitly best-effort because transcript JSONL is not a
+deduplication, a macOS per-user LaunchAgent, and a Windows per-user startup
+entry. It is explicitly best-effort because transcript JSONL is not a
 stable Codex extension interface.
 
 ## 2. Product Goals
@@ -60,7 +60,7 @@ stable Codex extension interface.
 | --- | --- | --- |
 | macOS Apple Silicon | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
 | macOS Intel | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
-| Windows x64 | Required | M1 completion dispatcher and Hook; M2 Task Scheduler |
+| Windows x64 | Required | M1 completion dispatcher and Hook; M2 startup entry |
 
 The main binary must be self-contained. End users must not need Rust, Python,
 Node.js, or a package manager after installation.
@@ -382,10 +382,11 @@ stdout/stderr logs. No administrator privileges are required.
 
 ### 12.2 Windows
 
-`init` creates a per-user `Codex Notify Watcher` Task Scheduler task triggered
-at logon. The task runs `codex-notify watch`, ignores overlapping instances,
-restarts after failure, and does not require a system-wide service or
-administrator privileges.
+`init` creates a per-user `CodexNotifyWatcher` value under the current user's
+Windows `Run` registry key. It starts `codex-notify watch` in a hidden window
+at logon and does not require a system-wide service or administrator
+privileges. The watcher handles scan failures inside its long-running process;
+an unexpected process exit is recovered at the next login.
 
 ### 12.3 Watcher behavior
 
@@ -428,7 +429,7 @@ src/
   codex/              config integration, hooks, event parsing, state
   core/               notification model, duration, redaction, deduplication
   providers/          provider trait and Feishu adapter
-  platform/           macOS LaunchAgent and Windows Task Scheduler adapters
+  platform/           macOS LaunchAgent and Windows startup adapters
   secrets/            credential-store abstraction
   transcripts/        incremental transcript sources and fixtures
 ```
@@ -443,7 +444,7 @@ Recommended Rust boundaries:
 - `thiserror` for user-facing typed errors.
 
 The core and provider adapters must be testable without the live Codex app,
-Feishu API, Keychain, Credential Manager, LaunchAgent, or Task Scheduler.
+Feishu API, Keychain, Credential Manager, LaunchAgent, or Windows startup.
 
 ## 16. Verification Requirements
 
@@ -519,7 +520,7 @@ upgrade, signing, and compatibility behavior are stable.
 ### M2: Error watcher
 
 - Implemented: incremental transcript watcher, two-stage confirmation, Stop
-  fallback handling, macOS LaunchAgent and Windows Task Scheduler integration,
+  fallback handling, macOS LaunchAgent and Windows startup integration,
   stream-disconnect and usage-limit fixtures, `doctor`, and deduplication.
 
 ### M3: Distribution hardening

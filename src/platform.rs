@@ -3,13 +3,19 @@
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use directories::UserDirs;
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::io::ErrorKind;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "windows")]
-use tempfile::NamedTempFile;
+use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 use crate::paths::AppPaths;
 #[cfg(target_os = "macos")]
@@ -17,8 +23,10 @@ use crate::settings::atomic_write;
 
 #[cfg(any(target_os = "macos", test))]
 const MACOS_LABEL: &str = "com.codex-notify.watcher";
-#[cfg(any(target_os = "windows", test))]
-const WINDOWS_TASK_NAME: &str = "Codex Notify Watcher";
+#[cfg(target_os = "windows")]
+const WINDOWS_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const WINDOWS_RUN_VALUE: &str = "CodexNotifyWatcher";
 
 pub fn install_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -60,11 +68,9 @@ pub fn is_watcher_installed(_paths: &AppPaths) -> Result<bool> {
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(Command::new("schtasks.exe")
-            .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false))
+        Ok(read_windows_run_command()?
+            .as_deref()
+            .is_some_and(is_managed_windows_run_command))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -79,7 +85,9 @@ pub fn watcher_location() -> Result<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(format!("Task Scheduler: {WINDOWS_TASK_NAME}"))
+        Ok(format!(
+            "Registry: HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -182,59 +190,54 @@ fn is_managed_macos_plist(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
-    fs::create_dir_all(&paths.state)
-        .with_context(|| format!("could not create {}", paths.state.display()))?;
-    let mut temporary = NamedTempFile::new_in(&paths.state)
-        .with_context(|| format!("could not create a task file in {}", paths.state.display()))?;
-    use std::io::Write;
-    let task_xml = windows_task_xml(binary, &paths.root);
-    temporary
-        .write_all(&utf16le_xml(&task_xml))
-        .context("could not write Windows task definition")?;
-    temporary
-        .flush()
-        .context("could not flush Windows task definition")?;
-    // NamedTempFile keeps its handle open, which prevents schtasks.exe from
-    // reading the XML on Windows. Keep the auto-deleting path alive while
-    // closing the file handle before starting the child process.
-    let temporary_path = temporary.into_temp_path();
-    let temporary_path_string = temporary_path.display().to_string();
-    let status = Command::new("schtasks.exe")
-        .args([
-            "/Create",
-            "/TN",
-            WINDOWS_TASK_NAME,
-            "/XML",
-            &temporary_path_string,
-            "/F",
-        ])
-        .status()
-        .context("could not create the Windows Task Scheduler task")?;
-    if !status.success() {
-        bail!("schtasks could not create the codex-notify watcher ({status})");
+fn install_windows_watcher(_paths: &AppPaths, binary: &Path) -> Result<()> {
+    if let Some(existing) = read_windows_run_command()?
+        && !is_managed_windows_run_command(&existing)
+    {
+        bail!("refusing to overwrite user-managed Windows startup entry {WINDOWS_RUN_VALUE}");
     }
-    Ok(())
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let (run_key, _) = current_user
+        .create_subkey(WINDOWS_RUN_KEY)
+        .context("could not open the current user's Windows startup registry key")?;
+    run_key
+        .set_value(WINDOWS_RUN_VALUE, &windows_run_command(binary))
+        .context("could not install the codex-notify Windows startup entry")
 }
 
 #[cfg(target_os = "windows")]
 fn uninstall_windows_watcher() -> Result<()> {
-    let exists = Command::new("schtasks.exe")
-        .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if !exists {
+    let Some(existing) = read_windows_run_command()? else {
         return Ok(());
+    };
+    if !is_managed_windows_run_command(&existing) {
+        bail!("refusing to remove user-managed Windows startup entry {WINDOWS_RUN_VALUE}");
     }
-    let status = Command::new("schtasks.exe")
-        .args(["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
-        .status()
-        .context("could not remove the Windows Task Scheduler task")?;
-    if !status.success() {
-        bail!("schtasks could not remove the codex-notify watcher ({status})");
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = current_user
+        .open_subkey_with_flags(WINDOWS_RUN_KEY, KEY_READ | KEY_WRITE)
+        .context("could not open the current user's Windows startup registry key")?;
+    run_key
+        .delete_value(WINDOWS_RUN_VALUE)
+        .context("could not remove the codex-notify Windows startup entry")
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_run_command() -> Result<Option<String>> {
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = match current_user.open_subkey(WINDOWS_RUN_KEY) {
+        Ok(key) => key,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .context("could not open the current user's Windows startup registry key");
+        }
+    };
+    match run_key.get_value(WINDOWS_RUN_VALUE) {
+        Ok(command) => Ok(Some(command)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("could not read the codex-notify Windows startup entry"),
     }
-    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -269,39 +272,21 @@ fn macos_plist(binary: &Path, app_data: &Path, codex_home: &Path) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_task_xml(binary: &Path, app_data: &Path) -> String {
-    let binary = xml_escape(&binary.display().to_string());
-    let app_data = xml_escape(&app_data.display().to_string());
+fn windows_run_command(binary: &Path) -> String {
+    let binary = binary.to_string_lossy().replace('\'', "''");
     format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><URI>\{WINDOWS_TASK_NAME}</URI></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec><Command>{binary}</Command><Arguments>watch</Arguments><WorkingDirectory>{app_data}</WorkingDirectory></Exec>
-  </Actions>
-</Task>
-"#
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& '{binary}' watch\""
     )
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn utf16le_xml(value: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
-    bytes.extend_from_slice(&[0xff, 0xfe]);
-    for code_unit in value.encode_utf16() {
-        bytes.extend_from_slice(&code_unit.to_le_bytes());
-    }
-    bytes
+fn is_managed_windows_run_command(command: &str) -> bool {
+    command.starts_with(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& '",
+    ) && command.ends_with("' watch\"")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -313,7 +298,7 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_plist, utf16le_xml, windows_task_xml};
+    use super::{is_managed_windows_run_command, macos_plist, windows_run_command};
     use std::path::Path;
 
     #[test]
@@ -329,23 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_restarts_a_single_watcher_at_logon() {
-        let task = windows_task_xml(
-            Path::new("C:\\bin\\codex-notify.exe"),
-            Path::new("C:\\data"),
+    fn windows_startup_entry_runs_a_hidden_watcher() {
+        let command = windows_run_command(Path::new("C:\\Program Files\\codex-notify.exe"));
+        assert_eq!(
+            command,
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& 'C:\\Program Files\\codex-notify.exe' watch\""
         );
-        assert!(task.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
-        assert!(task.contains("<LogonTrigger>"));
-        assert!(task.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
-        assert!(task.contains("<RestartOnFailure>"));
-        assert!(task.contains("<Arguments>watch</Arguments>"));
-
-        let bytes = utf16le_xml(&task);
-        assert_eq!(&bytes[..2], &[0xff, 0xfe]);
-        let code_units = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        assert_eq!(String::from_utf16(&code_units).expect("UTF-16 XML"), task);
+        assert!(is_managed_windows_run_command(&command));
+        assert!(!is_managed_windows_run_command("other-notifier.exe"));
     }
 }

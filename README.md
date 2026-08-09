@@ -26,8 +26,8 @@ M2 is implemented:
 - Two-stage confirmation: ordinary errors wait 30 seconds; a later
   `task_started` cancels the alert. Active Goals wait for `blocked`,
   `usage_limited`, `budget_limited`, or 10 minutes of silence.
-- A per-user macOS LaunchAgent or Windows Task Scheduler task that keeps the
-  low-resource watcher running after login.
+- A per-user macOS LaunchAgent or Windows startup entry that starts the
+  low-resource watcher after login.
 - Reversible preservation of an existing Codex notify command.
 - App Secret storage in macOS Keychain or Windows Credential Manager.
 
