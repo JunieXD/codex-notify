@@ -67,6 +67,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+      - name: Validate release announcement
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/release_notes.py check "$TAG"
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -79,6 +84,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --generate-notes
+          NOTES_FILE="docs/releases/${TAG}.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "codex-notify ${TAG}" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "codex-notify ${TAG}" \
+              --notes-file "$NOTES_FILE"
+          fi
           gh release upload "$TAG" dist/* --clobber
