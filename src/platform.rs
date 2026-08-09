@@ -188,8 +188,9 @@ fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     let mut temporary = NamedTempFile::new_in(&paths.state)
         .with_context(|| format!("could not create a task file in {}", paths.state.display()))?;
     use std::io::Write;
+    let task_xml = windows_task_xml(binary, &paths.root);
     temporary
-        .write_all(windows_task_xml(binary, &paths.root).as_bytes())
+        .write_all(&utf16le_xml(&task_xml))
         .context("could not write Windows task definition")?;
     temporary
         .flush()
@@ -272,7 +273,7 @@ fn windows_task_xml(binary: &Path, app_data: &Path) -> String {
     let binary = xml_escape(&binary.display().to_string());
     let app_data = xml_escape(&app_data.display().to_string());
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><URI>\{WINDOWS_TASK_NAME}</URI></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
@@ -291,6 +292,16 @@ fn windows_task_xml(binary: &Path, app_data: &Path) -> String {
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn utf16le_xml(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
+    bytes.extend_from_slice(&[0xff, 0xfe]);
+    for code_unit in value.encode_utf16() {
+        bytes.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    bytes
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -302,7 +313,7 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_plist, windows_task_xml};
+    use super::{macos_plist, utf16le_xml, windows_task_xml};
     use std::path::Path;
 
     #[test]
@@ -323,9 +334,18 @@ mod tests {
             Path::new("C:\\bin\\codex-notify.exe"),
             Path::new("C:\\data"),
         );
+        assert!(task.starts_with(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
         assert!(task.contains("<LogonTrigger>"));
         assert!(task.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(task.contains("<RestartOnFailure>"));
         assert!(task.contains("<Arguments>watch</Arguments>"));
+
+        let bytes = utf16le_xml(&task);
+        assert_eq!(&bytes[..2], &[0xff, 0xfe]);
+        let code_units = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&code_units).expect("UTF-16 XML"), task);
     }
 }
