@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">codex-notify logo</title>
+  <desc id="description">A terminal prompt inside a notification bell</desc>
+  <defs>
+    <linearGradient id="background" x1="36" y1="28" x2="222" y2="230" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4F7CFF"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="62" y1="42" x2="184" y2="208" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="12" y="12" width="232" height="232" rx="62" fill="url(#background)"/>
+  <path d="M50 57C78 25 128 13 174 29C201 38 223 57 244 83V74C244 39.8 216.2 12 182 12H74C39.8 12 12 39.8 12 74V121C21 94 33 76 50 57Z" fill="url(#shine)"/>
+
+  <path d="M128 51C90.9 51 64 79.3 64 116.1V154C64 163.9 60.5 173.4 54.2 180.5L45.9 189.8C41.3 194.9 44.9 203 51.8 203H204.2C211.1 203 214.7 194.9 210.1 189.8L201.8 180.5C195.5 173.4 192 163.9 192 154V116.1C192 79.3 165.1 51 128 51Z" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M104 204C108 218.7 116.7 226 128 226C139.3 226 148 218.7 152 204" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round"/>
+
+  <path d="M91 118L109 135.5L91 153" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M124 153H165" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round"/>
+</svg>

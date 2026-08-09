@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🔔 codex-notify
+<img src="assets/logo.svg" alt="codex-notify logo" width="112" height="112">
+
+<h1>codex-notify</h1>
 
 **让 Codex 完成任务或意外中断时，及时在飞书提醒你。**
 
