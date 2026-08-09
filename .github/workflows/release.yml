@@ -29,17 +29,28 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive_format: zip
             asset_name: codex-notify-x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_format: tar.gz
+            asset_name: codex-notify-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_format: tar.gz
+            asset_name: codex-notify-aarch64-unknown-linux-gnu
     env:
       TARGET: ${{ matrix.target }}
       ASSET_NAME: ${{ matrix.asset_name }}
     steps:
       - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --locked --release --target "$TARGET"
         shell: bash
-      - name: Package macOS artifact
-        if: runner.os == 'macOS'
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           tar -czf "dist/${ASSET_NAME}.tar.gz" \

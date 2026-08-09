@@ -1,16 +1,16 @@
 //! Per-user background service integration for the transcript watcher.
 
 use anyhow::{Context, Result, bail};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use directories::UserDirs;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::io::ErrorKind;
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
@@ -18,7 +18,7 @@ use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 use crate::paths::AppPaths;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::settings::atomic_write;
 
 #[cfg(any(target_os = "macos", test))]
@@ -27,6 +27,10 @@ const MACOS_LABEL: &str = "com.codex-notify.watcher";
 const WINDOWS_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_VALUE: &str = "CodexNotifyWatcher";
+#[cfg(target_os = "linux")]
+const LINUX_UNIT_NAME: &str = "codex-notify-watcher.service";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_UNIT_MARKER: &str = "# Managed by codex-notify.";
 
 pub fn install_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -37,10 +41,14 @@ pub fn install_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     {
         install_windows_watcher(paths, binary)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        install_linux_watcher(paths, binary)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = (paths, binary);
-        bail!("the background watcher is supported on macOS and Windows only")
+        bail!("the background watcher is supported on macOS, Windows, and Linux only")
     }
 }
 
@@ -53,10 +61,14 @@ pub fn uninstall_watcher(_paths: &AppPaths) -> Result<()> {
     {
         uninstall_windows_watcher()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        uninstall_linux_watcher()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = _paths;
-        bail!("the background watcher is supported on macOS and Windows only")
+        bail!("the background watcher is supported on macOS, Windows, and Linux only")
     }
 }
 
@@ -72,7 +84,12 @@ pub fn is_watcher_installed(_paths: &AppPaths) -> Result<bool> {
             .as_deref()
             .is_some_and(is_managed_windows_run_command))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let path = linux_unit_path()?;
+        Ok(path.is_file() && is_managed_linux_unit(&path))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Ok(false)
     }
@@ -89,9 +106,13 @@ pub fn watcher_location() -> Result<String> {
             "Registry: HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"
         ))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
     {
-        bail!("the background watcher is supported on macOS and Windows only")
+        Ok(linux_unit_path()?.display().to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        bail!("the background watcher is supported on macOS, Windows, and Linux only")
     }
 }
 
@@ -189,6 +210,131 @@ fn is_managed_macos_plist(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+fn install_linux_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
+    let unit_path = linux_unit_path()?;
+    let previous = match fs::read(&unit_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", unit_path.display()));
+        }
+    };
+    if previous.is_some() && !is_managed_linux_unit(&unit_path) {
+        bail!(
+            "refusing to overwrite user-managed systemd unit {}",
+            unit_path.display()
+        );
+    }
+
+    let unit = linux_unit(binary, &paths.root, &paths.codex_home)?;
+    atomic_write(&unit_path, unit.as_bytes())?;
+    let install_result = (|| {
+        run_user_systemctl(&["daemon-reload"])?;
+        run_user_systemctl(&["enable", LINUX_UNIT_NAME])?;
+        run_user_systemctl(&["restart", LINUX_UNIT_NAME])?;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        ensure_linux_watcher_active()
+    })();
+    if let Err(install_error) = install_result {
+        let _ = run_user_systemctl(&["disable", "--now", LINUX_UNIT_NAME]);
+        let rollback_result = (|| {
+            match previous.as_deref() {
+                Some(contents) => atomic_write(&unit_path, contents)?,
+                None => match fs::remove_file(&unit_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("could not remove {}", unit_path.display()));
+                    }
+                },
+            }
+            run_user_systemctl(&["daemon-reload"])?;
+            if previous.is_some() {
+                run_user_systemctl(&["enable", LINUX_UNIT_NAME])?;
+                run_user_systemctl(&["restart", LINUX_UNIT_NAME])?;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                ensure_linux_watcher_active()?;
+            }
+            Ok(())
+        })();
+        if let Err(rollback_error) = rollback_result {
+            bail!(
+                "{install_error:#}; restoring the previous codex-notify watcher also failed: {rollback_error:#}"
+            );
+        }
+        return Err(install_error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_linux_watcher() -> Result<()> {
+    let unit_path = linux_unit_path()?;
+    if !unit_path.exists() {
+        return Ok(());
+    }
+    if !is_managed_linux_unit(&unit_path) {
+        bail!(
+            "refusing to remove user-managed systemd unit {}",
+            unit_path.display()
+        );
+    }
+
+    run_user_systemctl(&["disable", "--now", LINUX_UNIT_NAME])?;
+    fs::remove_file(&unit_path)
+        .with_context(|| format!("could not remove {}", unit_path.display()))?;
+    run_user_systemctl(&["daemon-reload"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_user_systemctl(arguments: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .status()
+        .context("could not run systemctl --user")?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("systemctl --user {} failed ({status})", arguments.join(" "))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_watcher_active() -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", LINUX_UNIT_NAME])
+        .status()
+        .context("could not verify the codex-notify systemd user service")?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!(
+        "the codex-notify systemd user service did not stay active; run 'systemctl --user status {LINUX_UNIT_NAME}' for details"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unit_path() -> Result<PathBuf> {
+    let home = UserDirs::new()
+        .map(|directories| directories.home_dir().to_path_buf())
+        .context("could not determine the current user home directory")?;
+    Ok(home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(LINUX_UNIT_NAME))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_managed_linux_unit(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|contents| contents.starts_with(LINUX_UNIT_MARKER))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "windows")]
 fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     if let Some(existing) = read_windows_run_command()?
@@ -274,6 +420,65 @@ fn macos_plist(binary: &Path, app_data: &Path, codex_home: &Path) -> String {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn linux_unit(binary: &Path, app_data: &Path, codex_home: &Path) -> Result<String> {
+    let binary_value = binary.display().to_string();
+    let app_data_value = app_data.display().to_string();
+    let codex_home_value = codex_home.display().to_string();
+    let binary = systemd_quote(&binary_value)?;
+    let working_directory = systemd_path_value(&app_data_value)?;
+    let app_environment = systemd_quote(&format!("CODEX_NOTIFY_HOME={app_data_value}"))?;
+    let codex_environment = systemd_quote(&format!("CODEX_NOTIFY_CODEX_HOME={codex_home_value}"))?;
+    Ok(format!(
+        r#"{LINUX_UNIT_MARKER}
+[Unit]
+Description=codex-notify background watcher
+
+[Service]
+Type=simple
+ExecStart={binary} watch
+WorkingDirectory={working_directory}
+Environment={app_environment}
+Environment={codex_environment}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+"#
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_path_value(value: &str) -> Result<String> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        bail!("systemd service values must not contain control characters");
+    }
+    Ok(value
+        .replace('\\', "\\\\")
+        .replace(' ', "\\x20")
+        .replace('"', "\\x22")
+        .replace('%', "%%"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_quote(value: &str) -> Result<String> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        bail!("systemd service values must not contain control characters");
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    Ok(format!("\"{escaped}\""))
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn windows_run_command(binary: &Path, app_data: &Path, codex_home: &Path) -> String {
     let binary = binary.to_string_lossy().replace('\'', "''");
@@ -311,8 +516,13 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_managed_windows_run_command, macos_plist, windows_run_command};
+    use super::{
+        LINUX_UNIT_MARKER, is_managed_linux_unit, is_managed_windows_run_command, linux_unit,
+        macos_plist, windows_run_command,
+    };
+    use std::fs;
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn macos_launch_agent_keeps_the_watcher_alive_with_explicit_paths() {
@@ -342,5 +552,38 @@ mod tests {
             "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& 'C:\\old-codex-notify.exe' watch\""
         ));
         assert!(!is_managed_windows_run_command("other-notifier.exe"));
+    }
+
+    #[test]
+    fn linux_user_service_keeps_the_watcher_alive_with_explicit_paths() {
+        let unit = linux_unit(
+            Path::new("/home/example/My Tools/codex-notify"),
+            Path::new("/home/example/App Data/codex-notify"),
+            Path::new("/home/example/Codex % profile"),
+        )
+        .expect("Linux user service");
+
+        assert!(unit.starts_with(LINUX_UNIT_MARKER));
+        assert!(unit.contains("ExecStart=\"/home/example/My Tools/codex-notify\" watch"));
+        assert!(unit.contains("WorkingDirectory=/home/example/App\\x20Data/codex-notify"));
+        assert!(
+            unit.contains("Environment=\"CODEX_NOTIFY_HOME=/home/example/App Data/codex-notify\"")
+        );
+        assert!(
+            unit.contains("Environment=\"CODEX_NOTIFY_CODEX_HOME=/home/example/Codex %% profile\"")
+        );
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn linux_user_service_ownership_requires_the_marker() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("codex-notify-watcher.service");
+        fs::write(&path, format!("{LINUX_UNIT_MARKER}\n[Service]\n")).expect("write managed unit");
+        assert!(is_managed_linux_unit(&path));
+
+        fs::write(&path, "[Service]\nExecStart=other-watcher\n").expect("write foreign unit");
+        assert!(!is_managed_linux_unit(&path));
     }
 }

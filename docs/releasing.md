@@ -39,4 +39,4 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-Release workflow 会再次校验本地公告，构建 macOS 和 Windows 安装包，生成 `SHA256SUMS`，最后发布 GitHub Release。
+Release workflow 会再次校验本地公告，构建 macOS、Windows 和 Linux 安装包，生成 `SHA256SUMS`，最后发布 GitHub Release。

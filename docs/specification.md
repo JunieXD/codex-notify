@@ -26,9 +26,9 @@ backup, and reversible uninstall.
 
 M2 terminal-error monitoring is also implemented. It uses incremental JSONL
 offsets, a durable two-stage confirmation state, transcript and Stop Hook
-deduplication, a macOS per-user LaunchAgent, and a Windows per-user startup
-entry. It is explicitly best-effort because transcript JSONL is not a
-stable Codex extension interface.
+deduplication, a macOS per-user LaunchAgent, a Windows per-user startup entry,
+and a Linux systemd user service. It is explicitly best-effort because
+transcript JSONL is not a stable Codex extension interface.
 
 ## 2. Product Goals
 
@@ -37,8 +37,8 @@ stable Codex extension interface.
 2. Let a user configure Feishu and Codex through one interactive command.
 3. Preserve existing user-level Codex notification behavior, including other
    notification programs already configured by the user.
-4. Support macOS and Windows from one Rust codebase and distribute standalone
-   binaries through GitHub Releases.
+4. Support macOS, Windows, and Linux from one Rust codebase and distribute
+   standalone binaries through GitHub Releases.
 5. Keep credentials out of plaintext configuration files.
 6. Make error detection best-effort, explain its limits honestly, and avoid
    duplicate notifications.
@@ -52,7 +52,6 @@ stable Codex extension interface.
 - Cloud synchronization of task history.
 - Guaranteed notification after a power loss, force quit, or OS crash.
 - Modifying Codex source code or relying on undocumented network APIs.
-- Supporting Linux in the first release. The architecture must not preclude it.
 
 ## 4. Supported Platforms
 
@@ -61,6 +60,8 @@ stable Codex extension interface.
 | macOS Apple Silicon | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
 | macOS Intel | Required | M1 completion dispatcher and Hook; M2 LaunchAgent |
 | Windows x64 | Required | M1 completion dispatcher and Hook; M2 startup entry |
+| Linux ARM64 | Required | M1 completion dispatcher and Hook; M2 systemd user service |
+| Linux x64 | Required | M1 completion dispatcher and Hook; M2 systemd user service |
 
 The main binary must be self-contained. End users must not need Rust, Python,
 Node.js, or a package manager after installation.
@@ -143,8 +144,8 @@ must carry its own previous notifier so profiles cannot use one another's
 downstream command. Atomic writes must follow a symbolic link to its target
 without replacing the link. `sync` exposes the same reconciliation explicitly.
 The per-user background startup entry must persist the application directory
-and `CODEX_HOME` explicitly on both macOS and Windows instead of relying on a
-future login shell to recreate those environment variables.
+and `CODEX_HOME` explicitly on macOS, Windows, and Linux instead of relying on
+a future login shell to recreate those environment variables.
 
 `uninstall` must recognize both a direct dispatcher and one nested immediately
 inside Computer Use. It restores each known managed configuration independently,
@@ -417,7 +418,16 @@ at logon and does not require a system-wide service or administrator
 privileges. The watcher handles scan failures inside its long-running process;
 an unexpected process exit is recovered at the next login.
 
-### 12.3 Watcher behavior
+### 12.3 Linux
+
+`init` installs a per-user systemd unit at
+`~/.config/systemd/user/codex-notify-watcher.service`. It starts
+`codex-notify watch` with the user session, restarts after unexpected failures,
+and does not require a system-wide service or administrator privileges. Linux
+credential storage uses the desktop Secret Service and must never fall back to
+a plaintext file.
+
+### 12.4 Watcher behavior
 
 The watcher is a low-resource long-running process. It scans immediately and
 then sleeps for 30 seconds, uses offsets instead of re-reading full JSONL
@@ -458,7 +468,7 @@ src/
   codex/              config integration, hooks, event parsing, state
   core/               notification model, duration, redaction, deduplication
   providers/          provider trait and Feishu adapter
-  platform/           macOS LaunchAgent and Windows startup adapters
+  platform/           macOS, Windows, and Linux background-service adapters
   secrets/            credential-store abstraction
   transcripts/        incremental transcript sources and fixtures
 ```
@@ -498,12 +508,14 @@ Tests must include:
 - Secret-redaction assertions.
 - Platform installer command generation.
 
-CI must run lint and tests on macOS and Windows. Release CI must build:
+CI must run lint and tests on macOS, Windows, and Linux. Release CI must build:
 
 ```text
 x86_64-apple-darwin
 aarch64-apple-darwin
 x86_64-pc-windows-msvc
+x86_64-unknown-linux-gnu
+aarch64-unknown-linux-gnu
 ```
 
 ## 17. Distribution and Releases
@@ -517,6 +529,8 @@ Each release publishes:
 codex-notify-x86_64-apple-darwin.tar.gz
 codex-notify-aarch64-apple-darwin.tar.gz
 codex-notify-x86_64-pc-windows-msvc.zip
+codex-notify-x86_64-unknown-linux-gnu.tar.gz
+codex-notify-aarch64-unknown-linux-gnu.tar.gz
 SHA256SUMS
 ```
 

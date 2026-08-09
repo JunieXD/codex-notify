@@ -589,6 +589,9 @@ pub struct IntegrationSetup {
     pub installation: InstallationConfig,
     pub config_backup: Option<PathBuf>,
     pub hooks_backup: Option<PathBuf>,
+    modified_config_path: PathBuf,
+    notify_before: Option<Vec<String>>,
+    notify_after: Vec<String>,
 }
 
 pub fn install_integration(
@@ -626,7 +629,7 @@ pub fn install_integration(
     let mut notify_written = false;
     let result = (|| {
         if !set_notify_command_if_unchanged(
-            &config_path,
+            &initial_resolved_config_path,
             original_config.as_deref(),
             &plan.active_command,
         )? {
@@ -671,12 +674,9 @@ pub fn install_integration(
     {
         managed_config_paths.push(legacy_path);
     }
-    let resolved_config_path = resolved_write_path(&config_path)
-        .unwrap_or(initial_resolved_config_path)
-        .to_string_lossy()
-        .into_owned();
+    let resolved_config_path = initial_resolved_config_path.to_string_lossy().into_owned();
     if !managed_config_paths.contains(&resolved_config_path) {
-        managed_config_paths.push(resolved_config_path);
+        managed_config_paths.push(resolved_config_path.clone());
     }
 
     Ok(IntegrationSetup {
@@ -694,6 +694,9 @@ pub fn install_integration(
         },
         config_backup,
         hooks_backup,
+        modified_config_path: initial_resolved_config_path,
+        notify_before: active_notify,
+        notify_after: plan.active_command,
     })
 }
 
@@ -723,23 +726,14 @@ fn installation_managed_programs_with(
 }
 
 pub fn rollback_integration(paths: &AppPaths, setup: &IntegrationSetup) -> Result<()> {
-    let mut config_paths = setup
-        .installation
-        .managed_config_paths
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    config_paths.push(paths.codex_config());
-    config_paths.sort();
-    config_paths.dedup();
-    for config_path in config_paths {
-        if config_path.exists() {
-            let _ = restore_notify_command(&config_path, &setup.installation)?;
-        }
-    }
+    let _ = restore_notify_if_current(
+        &setup.modified_config_path,
+        &setup.notify_after,
+        setup.notify_before.as_deref(),
+    )?;
     restore_from_backup(&paths.codex_hooks(), setup.hooks_backup.as_deref())?;
     remove_empty_created_codex_files(
-        &paths.codex_config(),
+        &setup.modified_config_path,
         &paths.codex_hooks(),
         &setup.installation,
     )
@@ -1160,6 +1154,50 @@ mod tests {
             "notify = [\"python3\", \"/tmp/previous-notify.py\"]\n"
         );
         assert!(!paths.codex_hooks().exists());
+    }
+
+    #[test]
+    fn failed_upgrade_rollback_restores_the_previous_managed_integration_only() {
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = paths(app_home.path(), codex_home.path());
+        let first = install_integration(&paths, Path::new("/tmp/codex-notify-old"), None)
+            .expect("install old integration");
+        let old_notify = read_notify_command(&paths.codex_config())
+            .expect("read old notifier")
+            .expect("old notifier");
+
+        let historical_config = codex_home.path().join("profile-a.toml");
+        set_notify_command(&historical_config, &old_notify).expect("write historical profile");
+        let mut previous_installation = first.installation.clone();
+        previous_installation
+            .managed_config_paths
+            .push(historical_config.to_string_lossy().into_owned());
+
+        let upgrade = install_integration(
+            &paths,
+            Path::new("/tmp/codex-notify-new"),
+            Some(&previous_installation),
+        )
+        .expect("install upgraded integration");
+        assert_ne!(
+            read_notify_command(&paths.codex_config()).expect("read upgraded notifier"),
+            Some(old_notify.clone())
+        );
+
+        rollback_integration(&paths, &upgrade).expect("rollback upgrade");
+
+        assert_eq!(
+            read_notify_command(&paths.codex_config()).expect("read restored notifier"),
+            Some(old_notify.clone())
+        );
+        assert_eq!(
+            read_notify_command(&historical_config).expect("read historical notifier"),
+            Some(old_notify)
+        );
+        let hooks = fs::read_to_string(paths.codex_hooks()).expect("read restored hooks");
+        assert!(hooks.contains("/tmp/codex-notify-old"));
+        assert!(!hooks.contains("/tmp/codex-notify-new"));
     }
 
     #[test]

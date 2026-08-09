@@ -6,23 +6,27 @@ REPOSITORY="${CODEX_NOTIFY_REPOSITORY:-JunieXD/codex-notify}"
 VERSION="${CODEX_NOTIFY_VERSION:-latest}"
 INSTALL_DIR="${CODEX_NOTIFY_INSTALL_DIR:-$HOME/.local/bin}"
 
-case "$(uname -s)" in
-    Darwin) ;;
-    *)
-        echo "codex-notify currently supports macOS and Windows only." >&2
-        exit 2
-        ;;
-esac
-
-case "$(uname -m)" in
-    arm64)
+SYSTEM="$(uname -s)"
+ARCHITECTURE="$(uname -m)"
+case "${SYSTEM}:${ARCHITECTURE}" in
+    Darwin:arm64)
         TARGET="aarch64-apple-darwin"
         ;;
-    x86_64)
+    Darwin:x86_64)
         TARGET="x86_64-apple-darwin"
         ;;
+    Linux:aarch64 | Linux:arm64)
+        TARGET="aarch64-unknown-linux-gnu"
+        ;;
+    Linux:x86_64 | Linux:amd64)
+        TARGET="x86_64-unknown-linux-gnu"
+        ;;
+    Darwin:* | Linux:*)
+        echo "Unsupported ${SYSTEM} architecture: ${ARCHITECTURE}" >&2
+        exit 2
+        ;;
     *)
-        echo "Unsupported macOS architecture: $(uname -m)" >&2
+        echo "codex-notify currently supports macOS, Windows, and Linux only." >&2
         exit 2
         ;;
 esac
@@ -49,7 +53,14 @@ curl -fsSL --retry 3 --retry-delay 1 \
 (
     cd "$TEMP_DIR"
     grep -F "  ${ASSET}" SHA256SUMS > "${ASSET}.sha256"
-    shasum -a 256 -c "${ASSET}.sha256"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "${ASSET}.sha256"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c "${ASSET}.sha256"
+    else
+        echo "A SHA-256 checksum tool is required (sha256sum or shasum)." >&2
+        exit 2
+    fi
 )
 
 mkdir -p "$INSTALL_DIR"

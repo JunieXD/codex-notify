@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/github/v/release/JunieXD/codex-notify?display_name=tag&style=flat-square)](https://github.com/JunieXD/codex-notify/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/JunieXD/codex-notify/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/JunieXD/codex-notify/actions/workflows/ci.yml)
-![Platform](https://img.shields.io/badge/平台-macOS%20%7C%20Windows-5b6ee1?style=flat-square)
+![Platform](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-5b6ee1?style=flat-square)
 [![License](https://img.shields.io/github/license/JunieXD/codex-notify?style=flat-square)](LICENSE)
 
 [快速开始](#快速开始) · [功能](#主要功能) · [常用命令](#常用命令) · [隐私安全](#隐私与安全) · [更新公告](https://github.com/JunieXD/codex-notify/releases)
@@ -23,7 +23,7 @@
 - **登录自启**：安装低资源占用的后台 watcher，无需管理员权限。
 - **兼容 Computer Use**：保持 Computer Use 在通知链最外层，避免重复执行。
 - **适配多套配置**：切换 `config.toml` 后自动补回集成，并保留各自原有 notifier。
-- **安全存储**：App Secret 仅保存在 macOS 钥匙串或 Windows 凭据管理器中。
+- **安全存储**：App Secret 仅保存在系统钥匙串或凭据管理器中。
 - **随时撤销**：保留原有 Codex notifier，卸载时恢复原配置。
 
 ## 支持平台
@@ -33,14 +33,16 @@
 | macOS Apple Silicon | `aarch64-apple-darwin` | LaunchAgent |
 | macOS Intel | `x86_64-apple-darwin` | LaunchAgent |
 | Windows x64 | `x86_64-pc-windows-msvc` | 当前用户登录项 |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | systemd 用户服务 |
+| Linux x64 | `x86_64-unknown-linux-gnu` | systemd 用户服务 |
 
-Linux 暂未提供发行包。
+Linux 需要 systemd 用户会话和可用的 Secret Service，例如 Ubuntu 桌面自带的 GNOME Keyring。安装和运行均不需要管理员权限。
 
 ## 快速开始
 
 ### 1. 安装
 
-macOS：
+macOS 与 Linux：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JunieXD/codex-notify/main/scripts/install.sh | sh
@@ -123,7 +125,7 @@ flowchart LR
 
 如果你使用配置管理工具切换同一 `CODEX_HOME` 下的 `config.toml`，后台 watcher 会检测当前配置并自动补回通知链。每套配置原有的 notifier 会保存在它自己的托管命令中，不会与其他配置混用。
 
-安装时会记住当前应用目录和 `CODEX_HOME`，macOS 或 Windows 重新登录后仍会监控同一套配置。
+安装时会记住当前应用目录和 `CODEX_HOME`，重新登录系统后仍会监控同一套配置。
 
 需要立即同步时运行：
 
