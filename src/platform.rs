@@ -194,13 +194,18 @@ fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     temporary
         .flush()
         .context("could not flush Windows task definition")?;
+    // NamedTempFile keeps its handle open, which prevents schtasks.exe from
+    // reading the XML on Windows. Keep the auto-deleting path alive while
+    // closing the file handle before starting the child process.
+    let temporary_path = temporary.into_temp_path();
+    let temporary_path_string = temporary_path.display().to_string();
     let status = Command::new("schtasks.exe")
         .args([
             "/Create",
             "/TN",
             WINDOWS_TASK_NAME,
             "/XML",
-            &temporary.path().display().to_string(),
+            &temporary_path_string,
             "/F",
         ])
         .status()
