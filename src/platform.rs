@@ -190,7 +190,7 @@ fn is_managed_macos_plist(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_watcher(_paths: &AppPaths, binary: &Path) -> Result<()> {
+fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     if let Some(existing) = read_windows_run_command()?
         && !is_managed_windows_run_command(&existing)
     {
@@ -201,7 +201,10 @@ fn install_windows_watcher(_paths: &AppPaths, binary: &Path) -> Result<()> {
         .create_subkey(WINDOWS_RUN_KEY)
         .context("could not open the current user's Windows startup registry key")?;
     run_key
-        .set_value(WINDOWS_RUN_VALUE, &windows_run_command(binary))
+        .set_value(
+            WINDOWS_RUN_VALUE,
+            &windows_run_command(binary, &paths.root, &paths.codex_home),
+        )
         .context("could not install the codex-notify Windows startup entry")
 }
 
@@ -272,18 +275,28 @@ fn macos_plist(binary: &Path, app_data: &Path, codex_home: &Path) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_run_command(binary: &Path) -> String {
+fn windows_run_command(binary: &Path, app_data: &Path, codex_home: &Path) -> String {
     let binary = binary.to_string_lossy().replace('\'', "''");
+    let app_data = app_data.to_string_lossy().replace('\'', "''");
+    let codex_home = codex_home.to_string_lossy().replace('\'', "''");
     format!(
-        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& '{binary}' watch\""
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"$env:CODEX_NOTIFY_HOME='{app_data}'; $env:CODEX_NOTIFY_CODEX_HOME='{codex_home}'; & '{binary}' watch\""
     )
 }
 
 #[cfg(any(target_os = "windows", test))]
 fn is_managed_windows_run_command(command: &str) -> bool {
-    command.starts_with(
-        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& '",
-    ) && command.ends_with("' watch\"")
+    const PREFIX: &str =
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"";
+    let body = command
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix("' watch\""));
+    body.is_some_and(|value| {
+        value.starts_with("& '")
+            || (value.starts_with("$env:CODEX_NOTIFY_HOME='")
+                && value.contains("'; $env:CODEX_NOTIFY_CODEX_HOME='")
+                && value.contains("'; & '"))
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -314,13 +327,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_startup_entry_runs_a_hidden_watcher() {
-        let command = windows_run_command(Path::new("C:\\Program Files\\codex-notify.exe"));
+    fn windows_startup_entry_runs_a_hidden_watcher_with_explicit_paths() {
+        let command = windows_run_command(
+            Path::new("C:\\Program Files\\codex-notify.exe"),
+            Path::new("C:\\Users\\example\\AppData\\Roaming\\codex-notify"),
+            Path::new("D:\\Managed Codex"),
+        );
         assert_eq!(
             command,
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& 'C:\\Program Files\\codex-notify.exe' watch\""
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"$env:CODEX_NOTIFY_HOME='C:\\Users\\example\\AppData\\Roaming\\codex-notify'; $env:CODEX_NOTIFY_CODEX_HOME='D:\\Managed Codex'; & 'C:\\Program Files\\codex-notify.exe' watch\""
         );
         assert!(is_managed_windows_run_command(&command));
+        assert!(is_managed_windows_run_command(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command \"& 'C:\\old-codex-notify.exe' watch\""
+        ));
         assert!(!is_managed_windows_run_command("other-notifier.exe"));
     }
 }

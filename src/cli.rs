@@ -1,29 +1,31 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Confirm, Input, Password};
+use fs2::FileExt;
 use serde_json::json;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::codex::{
-    CompletionEvent, PromptHookEvent, RestoreNotifyResult, StopHookEvent, backup_file,
-    completion_notification, has_prompt_hook, has_stop_hook, install_integration,
-    read_notify_command, record_prompt_context, remove_completion_state,
-    remove_empty_created_codex_files, remove_prompt_hook, remove_stop_hook, restore_notify_command,
-    rollback_integration, run_previous_notifier,
+    CompletionEvent, NotifyReconcileResult, PromptHookEvent, RestoreNotifyResult, StopHookEvent,
+    backup_file, completion_notification, has_prompt_hook, has_stop_hook, install_integration,
+    notify_integration_placement, reconcile_notify_integration, record_prompt_context,
+    remove_completion_state, remove_empty_created_codex_files, remove_prompt_hook,
+    remove_stop_hook, restore_notify_command, rollback_integration, run_previous_notifier,
 };
 use crate::diagnostics;
 use crate::feishu::FeishuClient;
 use crate::model::Notification;
 use crate::monitor;
+use crate::notify_config::parse_forward_notify;
 use crate::paths::AppPaths;
 use crate::platform;
 use crate::secrets::{KeyringSecretStore, SecretStore};
-use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType, atomic_write};
+use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType, atomic_write, resolved_write_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,12 +48,20 @@ enum Commands {
     Status(JsonOutput),
     /// Diagnose the local Codex and Feishu configuration.
     Doctor(JsonOutput),
+    /// Reapply the integration after another tool switches config.toml.
+    Sync,
     /// Restore the previous Codex notifier and remove codex-notify integration.
     Uninstall(UninstallArgs),
     /// Run the local terminal-error watcher.
     Watch(WatchArgs),
     #[command(hide = true)]
     Notify {
+        /// Marks the self-contained notify command written by codex-notify.
+        #[arg(long)]
+        managed: bool,
+        /// JSON command invoked before the Feishu notification.
+        #[arg(long)]
+        forward_notify: Option<String>,
         /// The single JSON argument supplied by Codex notify.
         event_json: String,
     },
@@ -107,6 +117,12 @@ struct WatchArgs {
     once: bool,
 }
 
+const CONFIG_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WATCHER_LOCK_FILENAME: &str = "watcher-process.lock";
+const WATCHER_STOP_FILENAME: &str = "watcher.stop";
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -114,9 +130,14 @@ pub fn run() -> ExitCode {
         Commands::Test => send_test(),
         Commands::Status(arguments) => status(arguments.json),
         Commands::Doctor(arguments) => doctor(arguments.json),
+        Commands::Sync => sync(),
         Commands::Uninstall(arguments) => uninstall(arguments),
         Commands::Watch(arguments) => watch(arguments),
-        Commands::Notify { event_json } => notify(event_json),
+        Commands::Notify {
+            managed,
+            forward_notify,
+            event_json,
+        } => notify(event_json, managed, forward_notify),
         Commands::PromptHook => prompt_hook(),
         Commands::StopHook => stop_hook(),
     };
@@ -199,6 +220,12 @@ fn init(arguments: InitArgs) -> Result<()> {
     let config = AppConfig::new(feishu.clone(), setup.installation.clone());
     if let Err(error) = config.save(&paths) {
         let _ = rollback_integration(&paths, &setup);
+        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
+        return Err(error);
+    }
+    if let Err(error) = clear_watcher_stop_request(&paths) {
+        let _ = rollback_integration(&paths, &setup);
+        let _ = restore_optional_file(&paths.config, original_app_config.as_deref());
         restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
         return Err(error);
     }
@@ -293,6 +320,27 @@ fn doctor(json_output: bool) -> Result<()> {
     Ok(())
 }
 
+fn sync() -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let mut config = configured(&paths)?;
+    let result = reconcile_active_config(&paths, &mut config)?;
+    if result.changed {
+        println!(
+            "Codex notify integration was synchronized ({}).",
+            result.placement.as_str()
+        );
+        if let Some(path) = result.config_backup {
+            println!("Config backup: {}", path.display());
+        }
+    } else {
+        println!(
+            "Codex notify integration is already synchronized ({}).",
+            result.placement.as_str()
+        );
+    }
+    Ok(())
+}
+
 fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json::Value> {
     let secret_status = config
         .map(|config| {
@@ -303,12 +351,16 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
             }
         })
         .unwrap_or("not_configured");
-    let active_notify = read_notify_command(&paths.codex_config())?;
-    let notifier_status = config
-        .map(|config| {
-            active_notify.as_deref() == Some(config.installation.managed_notify.as_slice())
-        })
-        .unwrap_or(false);
+    let (notifier_status, notifier_mode) = match config {
+        Some(config) => {
+            match notify_integration_placement(&paths.codex_config(), &config.installation) {
+                Ok(Some(placement)) => (true, placement.as_str()),
+                Ok(None) => (false, "detached"),
+                Err(_) => (false, "malformed"),
+            }
+        }
+        None => (false, "not_configured"),
+    };
     let hook_status = has_prompt_hook(&paths.codex_hooks())?;
     let stop_hook_status = has_stop_hook(&paths.codex_hooks())?;
     let watcher_status = platform::is_watcher_installed(paths)?;
@@ -319,6 +371,7 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
         "codex_home": paths.codex_home,
         "credential_store": secret_status,
         "codex_notify_installed": notifier_status,
+        "notify_integration": notifier_mode,
         "prompt_hook_installed": hook_status,
         "stop_hook_installed": stop_hook_status,
         "background_watcher_installed": watcher_status,
@@ -339,6 +392,7 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     let configured = data["configured"].as_bool().unwrap_or(false);
     let secret = data["credential_store"].as_str().unwrap_or("unavailable");
     let notifier = data["codex_notify_installed"].as_bool().unwrap_or(false);
+    let notifier_mode = data["notify_integration"].as_str().unwrap_or("unknown");
     let hook = data["prompt_hook_installed"].as_bool().unwrap_or(false);
     let stop_hook = data["stop_hook_installed"].as_bool().unwrap_or(false);
     let watcher = data["background_watcher_installed"]
@@ -346,10 +400,24 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
         .unwrap_or(false);
     println!("Configured: {}", yes_no(configured));
     println!("Credential store: {secret}");
-    println!("Codex notify dispatcher: {}", yes_no(notifier));
+    println!(
+        "Codex notify dispatcher: {} ({notifier_mode})",
+        yes_no(notifier)
+    );
     println!("UserPromptSubmit hook: {}", yes_no(hook));
     println!("Stop hook: {}", yes_no(stop_hook));
     println!("Background watcher: {}", yes_no(watcher));
+    if include_guidance && configured && !notifier {
+        match notifier_mode {
+            "detached" => {
+                println!("Notify repair: run codex-notify sync for the active config.toml.")
+            }
+            "malformed" => println!(
+                "Notify repair: the active notify chain is malformed; inspect config.toml before retrying."
+            ),
+            _ => {}
+        }
+    }
     if include_guidance && hook {
         println!("Hook trust: inspect and trust both hooks with /hooks in Codex.");
         println!(
@@ -374,47 +442,80 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
 
     let config_path = PathBuf::from(&config.installation.codex_config_path);
     let hooks_path = PathBuf::from(&config.installation.codex_hooks_path);
-    let active_notify = read_notify_command(&config_path)?;
-    if active_notify.as_deref() != Some(config.installation.managed_notify.as_slice()) {
-        bail!(
-            "the active Codex notify command is no longer owned by codex-notify; no files were removed"
-        );
-    }
     platform::uninstall_watcher(&paths)?;
-    let _ = backup_file(&paths, &config_path, "uninstall-config")?;
-    let _ = backup_file(&paths, &hooks_path, "uninstall-hooks")?;
-    match restore_notify_command(&config_path, &config.installation)? {
-        RestoreNotifyResult::Restored => {}
-        RestoreNotifyResult::NotOwned => unreachable!("ownership was checked before uninstall"),
+    request_watcher_stop(&paths)?;
+    wait_for_watcher_exit(&paths)?;
+
+    let mut config_paths = config
+        .installation
+        .managed_config_paths
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    config_paths.push(config_path.clone());
+    config_paths.push(paths.codex_config());
+    let mut resolved_paths = Vec::new();
+    for path in config_paths {
+        let resolved = resolved_write_path(&path)?;
+        if !resolved_paths.contains(&resolved) {
+            resolved_paths.push(resolved);
+        }
     }
+
+    let mut restored_configs = 0usize;
+    for (index, path) in resolved_paths.iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        let _ = backup_file(&paths, path, &format!("uninstall-config-{index}"))?;
+        if restore_notify_command(path, &config.installation)? == RestoreNotifyResult::Restored {
+            restored_configs += 1;
+        }
+    }
+    let _ = backup_file(&paths, &hooks_path, "uninstall-hooks")?;
     let _ = remove_prompt_hook(&hooks_path)?;
     let _ = remove_stop_hook(&hooks_path)?;
     remove_empty_created_codex_files(&config_path, &hooks_path, &config.installation)?;
     let _ = KeyringSecretStore.delete_feishu_secret(&config.feishu);
     let _ = fs::remove_file(&paths.config);
     if paths.state.exists() {
-        fs::remove_dir_all(&paths.state)
-            .with_context(|| format!("could not remove {}", paths.state.display()))?;
+        remove_directory_tree(&paths.state)?;
     }
-    println!("codex-notify integration was removed and the previous notifier was restored.");
+    println!(
+        "codex-notify integration was removed; restored {restored_configs} managed Codex config file(s)."
+    );
     Ok(())
 }
 
-fn notify(event_json: String) -> Result<()> {
+fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let Some(config) = AppConfig::load(&paths)? else {
+    let config = AppConfig::load(&paths)?;
+    let embedded_previous = forward_notify
+        .as_deref()
+        .map(parse_forward_notify)
+        .transpose()?;
+    let previous = if managed {
+        embedded_previous.as_ref()
+    } else {
+        embedded_previous.as_ref().or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.installation.previous_notify.as_ref())
+        })
+    };
+    if let Some(previous) = previous
+        && run_previous_notifier(previous, &event_json).is_err()
+    {
+        diagnostics::record(&paths, "previous Codex notifier failed");
+    }
+
+    let Some(config) = config else {
         diagnostics::record(
             &paths,
             "notify skipped because codex-notify is not configured",
         );
         return Ok(());
     };
-
-    if let Some(previous) = config.installation.previous_notify.as_ref() {
-        if run_previous_notifier(previous, &event_json).is_err() {
-            diagnostics::record(&paths, "previous Codex notifier failed");
-        }
-    }
 
     let event: CompletionEvent = match serde_json::from_str(&event_json) {
         Ok(event) => event,
@@ -496,21 +597,95 @@ fn stop_hook() -> Result<()> {
 
 fn watch(arguments: WatchArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let config = configured(&paths)?;
+    let mut config = configured(&paths)?;
+    let _watcher_lease = (!arguments.once)
+        .then(|| acquire_watcher_lease(&paths))
+        .transpose()?;
+    let mut next_monitor_scan = Instant::now();
     loop {
-        match watch_once(&paths, &config) {
-            Ok(delivered) if arguments.once => {
-                println!(
-                    "Watcher scan completed; delivered {delivered} interruption notification(s)."
-                );
+        if !arguments.once {
+            if watcher_stop_requested(&paths) {
                 return Ok(());
             }
-            Ok(_) => {}
-            Err(error) if arguments.once => return Err(error),
-            Err(error) => diagnostics::record(&paths, &format!("watcher scan failed: {error:#}")),
+            let Some(latest_config) = AppConfig::load(&paths)? else {
+                return Ok(());
+            };
+            config = latest_config;
         }
-        thread::sleep(monitor::WATCH_INTERVAL);
+        if let Err(error) = reconcile_active_config(&paths, &mut config) {
+            if arguments.once {
+                return Err(error);
+            }
+            diagnostics::record(
+                &paths,
+                &format!("notify integration reconciliation failed: {error:#}"),
+            );
+        }
+        if arguments.once || Instant::now() >= next_monitor_scan {
+            match watch_once(&paths, &config) {
+                Ok(delivered) if arguments.once => {
+                    println!(
+                        "Watcher scan completed; delivered {delivered} interruption notification(s)."
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(error) if arguments.once => return Err(error),
+                Err(error) => {
+                    diagnostics::record(&paths, &format!("watcher scan failed: {error:#}"))
+                }
+            }
+            next_monitor_scan = Instant::now() + monitor::WATCH_INTERVAL;
+        }
+        thread::sleep(CONFIG_RECONCILE_INTERVAL);
     }
+}
+
+fn reconcile_active_config(
+    paths: &AppPaths,
+    config: &mut AppConfig,
+) -> Result<NotifyReconcileResult> {
+    let result = reconcile_notify_integration(paths, &config.installation)?;
+    let mut metadata_changed = false;
+
+    if config.installation.managed_notify != result.managed_notify {
+        if let Some(program) = config.installation.managed_notify.first()
+            && !config.installation.managed_binary_paths.contains(program)
+        {
+            config
+                .installation
+                .managed_binary_paths
+                .push(program.clone());
+        }
+        config.installation.managed_notify = result.managed_notify.clone();
+        metadata_changed = true;
+    }
+    if result.legacy_owned_before && config.installation.previous_notify != result.previous_notify {
+        config.installation.previous_notify = result.previous_notify.clone();
+        metadata_changed = true;
+    }
+    let managed_path = result.managed_config_path.to_string_lossy().into_owned();
+    if !config
+        .installation
+        .managed_config_paths
+        .contains(&managed_path)
+    {
+        config.installation.managed_config_paths.push(managed_path);
+        metadata_changed = true;
+    }
+    if let Some(program) = result.managed_notify.first()
+        && !config.installation.managed_binary_paths.contains(program)
+    {
+        config
+            .installation
+            .managed_binary_paths
+            .push(program.clone());
+        metadata_changed = true;
+    }
+    if metadata_changed {
+        config.save(paths)?;
+    }
+    Ok(result)
 }
 
 fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
@@ -669,5 +844,188 @@ fn restore_optional_file(path: &std::path::Path, contents: Option<&[u8]>) -> Res
                 Err(error).with_context(|| format!("could not remove {}", path.display()))
             }
         },
+    }
+}
+
+fn watcher_lock_path(paths: &AppPaths) -> PathBuf {
+    paths.state.join(WATCHER_LOCK_FILENAME)
+}
+
+fn watcher_stop_path(paths: &AppPaths) -> PathBuf {
+    paths.state.join(WATCHER_STOP_FILENAME)
+}
+
+fn acquire_watcher_lease(paths: &AppPaths) -> Result<File> {
+    paths.ensure_directories()?;
+    let path = watcher_lock_path(paths);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "another codex-notify watcher is already using {}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn watcher_stop_requested(paths: &AppPaths) -> bool {
+    watcher_stop_path(paths).exists()
+}
+
+fn clear_watcher_stop_request(paths: &AppPaths) -> Result<()> {
+    let path = watcher_stop_path(paths);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
+    }
+}
+
+fn request_watcher_stop(paths: &AppPaths) -> Result<()> {
+    paths.ensure_directories()?;
+    let path = watcher_stop_path(paths);
+    atomic_write(&path, b"stop\n").with_context(|| {
+        format!(
+            "could not request watcher shutdown through {}",
+            path.display()
+        )
+    })
+}
+
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // `fs2` uses `LockFileEx` on Windows. A competing lock is reported as
+        // `ERROR_LOCK_VIOLATION` instead of `ErrorKind::WouldBlock`.
+        error.raw_os_error() == Some(33)
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn wait_for_watcher_exit(paths: &AppPaths) -> Result<()> {
+    let deadline = Instant::now() + WATCHER_SHUTDOWN_TIMEOUT;
+    let path = watcher_lock_path(paths);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = FileExt::unlock(&file);
+                return Ok(());
+            }
+            Err(error) if is_lock_contended(&error) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "the background watcher did not stop within {} seconds; retry uninstall",
+                        WATCHER_SHUTDOWN_TIMEOUT.as_secs()
+                    );
+                }
+                thread::sleep(WATCHER_SHUTDOWN_POLL_INTERVAL);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not lock {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Remove an app-owned directory without relying on `remove_dir_all`.
+///
+/// Some Windows shared-folder drivers reject the recursive directory handle
+/// flags used by `std::fs::remove_dir_all` with `ERROR_INVALID_PARAMETER`.
+/// Walking the tree and removing each entry works on those filesystems while
+/// retaining the same symlink-safe behavior for this app-owned state tree.
+fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("could not read {}", path.display()))? {
+        let entry =
+            entry.with_context(|| format!("could not read an entry in {}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("could not inspect {}", entry_path.display()))?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            remove_directory_tree(&entry_path)?;
+        } else {
+            fs::remove_file(&entry_path)
+                .with_context(|| format!("could not remove {}", entry_path.display()))?;
+        }
+    }
+    fs::remove_dir(path).with_context(|| format!("could not remove {}", path.display()))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{
+        acquire_watcher_lease, remove_directory_tree, request_watcher_stop, wait_for_watcher_exit,
+        watcher_stop_requested,
+    };
+    use crate::paths::AppPaths;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn paths() -> (tempfile::TempDir, tempfile::TempDir, AppPaths) {
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = AppPaths {
+            root: app_home.path().to_path_buf(),
+            config: app_home.path().join("config.toml"),
+            state: app_home.path().join("state"),
+            logs: app_home.path().join("logs"),
+            backups: app_home.path().join("backups"),
+            codex_home: codex_home.path().to_path_buf(),
+        };
+        (app_home, codex_home, paths)
+    }
+
+    #[test]
+    fn portable_directory_cleanup_removes_nested_state() {
+        let parent = tempdir().expect("temporary parent");
+        let state = parent.path().join("state");
+        let nested = state.join("nested");
+        fs::create_dir_all(&nested).expect("create nested state");
+        fs::write(state.join("monitor.lock"), []).expect("write lock");
+        fs::write(nested.join("turn.json"), b"{}").expect("write nested state");
+
+        remove_directory_tree(&state).expect("remove state tree");
+
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn uninstall_handshake_waits_until_the_watcher_releases_its_lease() {
+        let (_app_home, _codex_home, paths) = paths();
+        let lease = acquire_watcher_lease(&paths).expect("watcher lease");
+        let watcher_paths = paths.clone();
+        let watcher = thread::spawn(move || {
+            while !watcher_stop_requested(&watcher_paths) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(lease);
+        });
+
+        request_watcher_stop(&paths).expect("request stop");
+        wait_for_watcher_exit(&paths).expect("wait for watcher");
+        watcher.join().expect("join watcher");
     }
 }

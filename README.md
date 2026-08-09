@@ -21,6 +21,8 @@
 - **中断提醒**：识别网络断开、服务异常、用量限制等终止情况。
 - **减少误报**：异常出现后会等待并确认任务没有自动恢复，再发送提醒。
 - **登录自启**：安装低资源占用的后台 watcher，无需管理员权限。
+- **兼容 Computer Use**：保持 Computer Use 在通知链最外层，避免重复执行。
+- **适配多套配置**：切换 `config.toml` 后自动补回集成，并保留各自原有 notifier。
 - **安全存储**：App Secret 仅保存在 macOS 钥匙串或 Windows 凭据管理器中。
 - **随时撤销**：保留原有 Codex notifier，卸载时恢复原配置。
 
@@ -85,6 +87,7 @@ codex-notify doctor
 | `codex-notify test` | 发送一条测试通知 |
 | `codex-notify status` | 查看安装和配置状态 |
 | `codex-notify doctor` | 检查常见配置问题 |
+| `codex-notify sync` | 立即同步当前 `config.toml` 的通知链 |
 | `codex-notify watch --once` | 手动扫描一次中断事件 |
 | `codex-notify uninstall` | 移除集成并恢复原配置 |
 
@@ -94,11 +97,14 @@ codex-notify doctor
 
 ```mermaid
 flowchart LR
-    A["Codex 任务"] -->|"正常完成"| B["Codex Hooks"]
-    A -->|"异常终止"| C["本地 watcher"]
-    B --> D["codex-notify"]
-    C -->|"确认未恢复"| D
-    D --> E["飞书卡片"]
+    A["Codex 任务"] -->|"正常完成"| B["notify 通知链"]
+    B --> C["Computer Use（可选）"]
+    C --> D["codex-notify"]
+    A -->|"任务上下文"| E["Codex Hooks"]
+    E --> D
+    A -->|"异常终止"| F["本地 watcher"]
+    F -->|"确认未恢复"| D
+    D --> G["飞书卡片"]
 ```
 
 后台 watcher 只增量读取最近变动的本地会话记录，并保存读取位置，不会反复扫描完整历史。
@@ -109,7 +115,23 @@ flowchart LR
 
 ## 与现有 notifier 共存
 
-初始化不会直接覆盖已有的 Codex `notify` 命令，而是先保存并继续调用它。如果旧 notifier 也向飞书发送消息，可能出现重复提醒；确认 `codex-notify` 工作正常后，再停用旧工具的飞书发送功能。
+初始化会保留并继续调用已有的 Codex `notify` 命令。检测到 Computer Use 时，CLI 会保持它在最外层，再把 `codex-notify` 接入其 `--previous-notify`；`codex-notify` 不会反向调用 Computer Use，因此不会形成重复链。
+
+如果旧 notifier 也向飞书发送消息，仍可能收到两条飞书提醒。确认 `codex-notify` 工作正常后，再停用旧工具的飞书发送功能。
+
+## 多套 Codex 配置
+
+如果你使用配置管理工具切换同一 `CODEX_HOME` 下的 `config.toml`，后台 watcher 会检测当前配置并自动补回通知链。每套配置原有的 notifier 会保存在它自己的托管命令中，不会与其他配置混用。
+
+安装时会记住当前应用目录和 `CODEX_HOME`，macOS 或 Windows 重新登录后仍会监控同一套配置。
+
+需要立即同步时运行：
+
+```sh
+codex-notify sync
+```
+
+CLI 支持配置文件符号链接，写入时会保留链接本身。无法识别或损坏的 Computer Use 包装不会被覆盖，`doctor` 会提示人工检查。
 
 ## 升级与卸载
 
@@ -119,7 +141,7 @@ flowchart LR
 codex-notify uninstall
 ```
 
-卸载只移除 `codex-notify` 管理的 Hook、后台启动项、凭据和状态，并恢复安装前保存的 notifier。
+卸载只移除 `codex-notify` 管理的 Hook、后台启动项、凭据和状态，并恢复已记录配置文件原有的 notifier。Computer Use 会继续保留在通知链最外层。
 
 ## 隐私与安全
 

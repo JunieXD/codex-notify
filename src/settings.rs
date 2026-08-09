@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use toml_edit::de::from_str;
 use toml_edit::ser::to_string_pretty;
@@ -113,6 +113,10 @@ impl ReceiverIdType {
 pub struct InstallationConfig {
     pub previous_notify: Option<Vec<String>>,
     pub managed_notify: Vec<String>,
+    #[serde(default)]
+    pub managed_binary_paths: Vec<String>,
+    #[serde(default)]
+    pub managed_config_paths: Vec<String>,
     pub codex_config_path: String,
     pub codex_hooks_path: String,
     pub prompt_hook_marker: String,
@@ -126,7 +130,7 @@ pub struct InstallationConfig {
 
 impl InstallationConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.managed_notify.is_empty() {
+        if self.managed_notify.len() < 2 {
             bail!("managed Codex notify command is missing");
         }
         if self.prompt_hook_marker.trim().is_empty() {
@@ -144,7 +148,8 @@ fn default_stop_hook_marker() -> String {
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
+    let destination = resolved_write_path(path)?;
+    let parent = destination
         .parent()
         .context("configuration path does not have a parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
@@ -160,19 +165,32 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("could not flush {}", path.display()))?;
 
     #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("could not replace {}", path.display()))?;
+    if destination.exists() {
+        fs::remove_file(&destination)
+            .with_context(|| format!("could not replace {}", destination.display()))?;
     }
     temporary
-        .persist(path)
+        .persist(&destination)
         .map_err(|error| error.error)
-        .with_context(|| format!("could not save {}", path.display()))?;
+        .with_context(|| format!("could not save {}", destination.display()))?;
     Ok(())
+}
+
+/// Resolve the file an atomic replacement should target without replacing a
+/// configuration manager's symbolic link with a regular file.
+pub fn resolved_write_path(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
+            .with_context(|| format!("could not resolve symbolic link {}", path.display())),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error).with_context(|| format!("could not inspect {}", path.display())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType};
+    use super::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType, atomic_write};
     use crate::paths::AppPaths;
     use tempfile::tempdir;
 
@@ -197,6 +215,8 @@ mod tests {
             InstallationConfig {
                 previous_notify: Some(vec!["existing-notifier".to_owned()]),
                 managed_notify: vec!["codex-notify".to_owned(), "notify".to_owned()],
+                managed_binary_paths: vec!["codex-notify".to_owned()],
+                managed_config_paths: vec!["/tmp/config.toml".to_owned()],
                 codex_config_path: "/tmp/config.toml".to_owned(),
                 codex_hooks_path: "/tmp/hooks.json".to_owned(),
                 prompt_hook_marker: "codex-notify: record task context".to_owned(),
@@ -231,5 +251,32 @@ prompt_hook_marker = "codex-notify: record task context"
         );
         assert!(!installation.created_codex_config);
         assert!(!installation.created_codex_hooks);
+        assert!(installation.managed_binary_paths.is_empty());
+        assert!(installation.managed_config_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_a_configuration_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory");
+        let target = directory.path().join("profile-a.toml");
+        let link = directory.path().join("config.toml");
+        std::fs::write(&target, "model = \"before\"\n").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        atomic_write(&link, b"model = \"after\"\n").expect("atomic write");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "model = \"after\"\n"
+        );
     }
 }

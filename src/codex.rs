@@ -8,8 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
 use crate::model::Notification;
+use crate::notify_config::{
+    NotifyPlacement, managed_notify_command as build_managed_notify_command, managed_programs,
+    plan_notify_integration, remove_notify_integration,
+};
 use crate::paths::AppPaths;
-use crate::settings::{InstallationConfig, atomic_write};
+use crate::settings::{InstallationConfig, atomic_write, resolved_write_path};
 use crate::state::{
     TurnState, elapsed_since, find_thread_title, load_turn_state, prune_turn_states,
     remove_turn_state, write_turn_state,
@@ -187,11 +191,15 @@ pub fn is_internal_prompt(prompt: &str) -> bool {
 }
 
 pub fn managed_notify_command(binary: &Path) -> Vec<String> {
-    vec![binary.to_string_lossy().into_owned(), "notify".to_owned()]
+    build_managed_notify_command(binary)
 }
 
 pub fn read_notify_command(config_path: &Path) -> Result<Option<Vec<String>>> {
     let document = read_toml_document(config_path)?;
+    notify_command_from_document(&document)
+}
+
+fn notify_command_from_document(document: &DocumentMut) -> Result<Option<Vec<String>>> {
     let Some(item) = document.get("notify") else {
         return Ok(None);
     };
@@ -208,6 +216,20 @@ pub fn read_notify_command(config_path: &Path) -> Result<Option<Vec<String>>> {
     Ok((!command.is_empty()).then_some(command))
 }
 
+fn notify_command_from_snapshot(
+    config_path: &Path,
+    contents: Option<&[u8]>,
+) -> Result<Option<Vec<String>>> {
+    let document = match contents {
+        Some(contents) => std::str::from_utf8(contents)
+            .with_context(|| format!("{} is not valid UTF-8", config_path.display()))?
+            .parse::<DocumentMut>()
+            .with_context(|| format!("could not parse {}", config_path.display()))?,
+        None => DocumentMut::new(),
+    };
+    notify_command_from_document(&document)
+}
+
 pub fn set_notify_command(config_path: &Path, command: &[String]) -> Result<()> {
     if command.is_empty() {
         bail!("cannot set an empty Codex notify command");
@@ -217,12 +239,51 @@ pub fn set_notify_command(config_path: &Path, command: &[String]) -> Result<()> 
     atomic_write(config_path, document.to_string().as_bytes())
 }
 
+fn set_notify_command_if_unchanged(
+    config_path: &Path,
+    expected_contents: Option<&[u8]>,
+    command: &[String],
+) -> Result<bool> {
+    if command.is_empty() {
+        bail!("cannot set an empty Codex notify command");
+    }
+    let current_contents = read_optional_file(config_path)?;
+    if current_contents.as_deref() != expected_contents {
+        return Ok(false);
+    }
+    let mut document = match expected_contents {
+        Some(contents) => std::str::from_utf8(contents)
+            .with_context(|| format!("{} is not valid UTF-8", config_path.display()))?
+            .parse::<DocumentMut>()
+            .with_context(|| format!("could not parse {}", config_path.display()))?,
+        None => DocumentMut::new(),
+    };
+    document["notify"] = command_item(command);
+    atomic_write(config_path, document.to_string().as_bytes())?;
+    Ok(true)
+}
+
 pub fn remove_notify_command(config_path: &Path) -> Result<()> {
     let mut document = read_toml_document(config_path)?;
     if document.remove("notify").is_some() {
         atomic_write(config_path, document.to_string().as_bytes())?;
     }
     Ok(())
+}
+
+fn restore_notify_if_current(
+    config_path: &Path,
+    expected_current: &[String],
+    previous: Option<&[String]>,
+) -> Result<bool> {
+    if read_notify_command(config_path)?.as_deref() != Some(expected_current) {
+        return Ok(false);
+    }
+    match previous {
+        Some(command) => set_notify_command(config_path, command)?,
+        None => remove_notify_command(config_path)?,
+    }
+    Ok(true)
 }
 
 pub fn install_prompt_hook(hooks_path: &Path, binary: &Path) -> Result<bool> {
@@ -427,15 +488,100 @@ pub fn restore_notify_command(
     installation: &InstallationConfig,
 ) -> Result<RestoreNotifyResult> {
     let active = read_notify_command(config_path)?;
-    if active.as_deref() != Some(installation.managed_notify.as_slice()) {
+    let programs = installation_managed_programs(installation);
+    let Some(removal) =
+        remove_notify_integration(active, &programs, installation.previous_notify.as_deref())?
+    else {
         return Ok(RestoreNotifyResult::NotOwned);
-    }
+    };
 
-    match &installation.previous_notify {
-        Some(command) => set_notify_command(config_path, command)?,
+    match removal.restored_command {
+        Some(command) => set_notify_command(config_path, &command)?,
         None => remove_notify_command(config_path)?,
     }
     Ok(RestoreNotifyResult::Restored)
+}
+
+pub fn notify_integration_placement(
+    config_path: &Path,
+    installation: &InstallationConfig,
+) -> Result<Option<NotifyPlacement>> {
+    let active = read_notify_command(config_path)?;
+    let binary = installation
+        .managed_notify
+        .first()
+        .context("managed codex-notify executable is missing")?;
+    let canonical_managed = managed_notify_command(Path::new(binary));
+    let programs = installation_managed_programs_with(installation, &canonical_managed);
+    let plan = plan_notify_integration(
+        active.clone(),
+        &canonical_managed,
+        &programs,
+        installation.previous_notify.as_deref(),
+    )?;
+    Ok((active.as_deref() == Some(plan.active_command.as_slice())).then_some(plan.placement))
+}
+
+#[derive(Debug, Clone)]
+pub struct NotifyReconcileResult {
+    pub changed: bool,
+    pub owned_before: bool,
+    pub legacy_owned_before: bool,
+    pub placement: NotifyPlacement,
+    pub managed_notify: Vec<String>,
+    pub previous_notify: Option<Vec<String>>,
+    pub managed_config_path: PathBuf,
+    pub config_backup: Option<PathBuf>,
+}
+
+pub fn reconcile_notify_integration(
+    paths: &AppPaths,
+    installation: &InstallationConfig,
+) -> Result<NotifyReconcileResult> {
+    let binary = installation
+        .managed_notify
+        .first()
+        .context("managed codex-notify executable is missing")?;
+    let canonical_managed = managed_notify_command(Path::new(binary));
+    let programs = installation_managed_programs_with(installation, &canonical_managed);
+    let config_path = paths.codex_config();
+    let initial_managed_config_path = resolved_write_path(&config_path)?;
+    let original_config = read_optional_file(&config_path)?;
+    let active = notify_command_from_snapshot(&config_path, original_config.as_deref())?;
+    let plan = plan_notify_integration(
+        active.clone(),
+        &canonical_managed,
+        &programs,
+        installation.previous_notify.as_deref(),
+    )?;
+    let changed = active.as_deref() != Some(plan.active_command.as_slice());
+    let config_backup = if changed {
+        let backup = backup_file(paths, &config_path, "reconcile-config")?;
+        if !set_notify_command_if_unchanged(
+            &config_path,
+            original_config.as_deref(),
+            &plan.active_command,
+        )? {
+            bail!(
+                "Codex config changed while codex-notify was preparing an update; retrying on the next reconciliation"
+            );
+        }
+        backup
+    } else {
+        None
+    };
+    let managed_config_path =
+        resolved_write_path(&config_path).unwrap_or(initial_managed_config_path);
+    Ok(NotifyReconcileResult {
+        changed,
+        owned_before: plan.owned_before,
+        legacy_owned_before: plan.legacy_owned_before,
+        placement: plan.placement,
+        managed_notify: canonical_managed,
+        previous_notify: plan.previous_notify,
+        managed_config_path,
+        config_backup,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -452,27 +598,21 @@ pub fn install_integration(
 ) -> Result<IntegrationSetup> {
     let config_path = paths.codex_config();
     let hooks_path = paths.codex_hooks();
-    let active_notify = read_notify_command(&config_path)?;
-    let managed_notify = managed_notify_command(binary);
-
-    let previous_notify = match previous_installation {
-        Some(installation)
-            if active_notify.as_deref() == Some(installation.managed_notify.as_slice()) =>
-        {
-            installation.previous_notify.clone()
-        }
-        Some(_) => {
-            bail!(
-                "Codex notify changed since codex-notify was installed; refusing to overwrite it"
-            );
-        }
-        None if active_notify.as_deref() == Some(managed_notify.as_slice()) => {
-            bail!("Codex notify already points to codex-notify, but its prior command is unknown");
-        }
-        None => active_notify,
-    };
-
     let original_config = read_optional_file(&config_path)?;
+    let active_notify = notify_command_from_snapshot(&config_path, original_config.as_deref())?;
+    let managed_notify = managed_notify_command(binary);
+    let initial_resolved_config_path = resolved_write_path(&config_path)?;
+    let historical_programs = previous_installation
+        .map(installation_historical_programs)
+        .unwrap_or_default();
+    let programs = managed_programs(&managed_notify, &historical_programs);
+    let plan = plan_notify_integration(
+        active_notify.clone(),
+        &managed_notify,
+        &programs,
+        previous_installation.and_then(|installation| installation.previous_notify.as_deref()),
+    )?;
+
     let original_hooks = read_optional_file(&hooks_path)?;
     let created_codex_config = previous_installation
         .map(|installation| installation.created_codex_config)
@@ -483,8 +623,18 @@ pub fn install_integration(
     let config_backup = backup_file(paths, &config_path, "config")?;
     let hooks_backup = backup_file(paths, &hooks_path, "hooks")?;
 
+    let mut notify_written = false;
     let result = (|| {
-        set_notify_command(&config_path, &managed_notify)?;
+        if !set_notify_command_if_unchanged(
+            &config_path,
+            original_config.as_deref(),
+            &plan.active_command,
+        )? {
+            bail!(
+                "Codex config changed while codex-notify was preparing installation; run init again"
+            );
+        }
+        notify_written = true;
         if has_prompt_hook(&hooks_path)? {
             remove_prompt_hook(&hooks_path)?;
         }
@@ -497,15 +647,44 @@ pub fn install_integration(
     })();
 
     if let Err(error) = result {
-        restore_original_file(&config_path, original_config.as_deref())?;
-        restore_original_file(&hooks_path, original_hooks.as_deref())?;
+        if notify_written {
+            let _ = restore_notify_if_current(
+                &config_path,
+                &plan.active_command,
+                active_notify.as_deref(),
+            );
+            restore_original_file(&hooks_path, original_hooks.as_deref())?;
+        }
         return Err(error);
+    }
+
+    let mut managed_binary_paths = historical_programs;
+    if !managed_binary_paths.contains(&managed_notify[0]) {
+        managed_binary_paths.push(managed_notify[0].clone());
+    }
+    let mut managed_config_paths = previous_installation
+        .map(|installation| installation.managed_config_paths.clone())
+        .unwrap_or_default();
+    if let Some(legacy_path) = previous_installation
+        .map(|installation| installation.codex_config_path.clone())
+        .filter(|path| !path.trim().is_empty() && !managed_config_paths.contains(path))
+    {
+        managed_config_paths.push(legacy_path);
+    }
+    let resolved_config_path = resolved_write_path(&config_path)
+        .unwrap_or(initial_resolved_config_path)
+        .to_string_lossy()
+        .into_owned();
+    if !managed_config_paths.contains(&resolved_config_path) {
+        managed_config_paths.push(resolved_config_path);
     }
 
     Ok(IntegrationSetup {
         installation: InstallationConfig {
-            previous_notify,
+            previous_notify: plan.previous_notify,
             managed_notify,
+            managed_binary_paths,
+            managed_config_paths,
             codex_config_path: config_path.to_string_lossy().into_owned(),
             codex_hooks_path: hooks_path.to_string_lossy().into_owned(),
             prompt_hook_marker: PROMPT_HOOK_MARKER.to_owned(),
@@ -518,9 +697,52 @@ pub fn install_integration(
     })
 }
 
+fn installation_historical_programs(installation: &InstallationConfig) -> Vec<String> {
+    let mut programs = installation.managed_binary_paths.clone();
+    if let Some(program) = installation.managed_notify.first()
+        && !program.trim().is_empty()
+        && !programs.contains(program)
+    {
+        programs.push(program.clone());
+    }
+    programs
+}
+
+fn installation_managed_programs(installation: &InstallationConfig) -> Vec<String> {
+    installation_managed_programs_with(installation, &installation.managed_notify)
+}
+
+fn installation_managed_programs_with(
+    installation: &InstallationConfig,
+    canonical_managed: &[String],
+) -> Vec<String> {
+    managed_programs(
+        canonical_managed,
+        &installation_historical_programs(installation),
+    )
+}
+
 pub fn rollback_integration(paths: &AppPaths, setup: &IntegrationSetup) -> Result<()> {
-    restore_from_backup(&paths.codex_config(), setup.config_backup.as_deref())?;
-    restore_from_backup(&paths.codex_hooks(), setup.hooks_backup.as_deref())
+    let mut config_paths = setup
+        .installation
+        .managed_config_paths
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    config_paths.push(paths.codex_config());
+    config_paths.sort();
+    config_paths.dedup();
+    for config_path in config_paths {
+        if config_path.exists() {
+            let _ = restore_notify_command(&config_path, &setup.installation)?;
+        }
+    }
+    restore_from_backup(&paths.codex_hooks(), setup.hooks_backup.as_deref())?;
+    remove_empty_created_codex_files(
+        &paths.codex_config(),
+        &paths.codex_hooks(),
+        &setup.installation,
+    )
 }
 
 pub fn run_previous_notifier(command: &[String], event_json: &str) -> Result<()> {
@@ -540,6 +762,7 @@ pub fn run_previous_notifier(command: &[String], event_json: &str) -> Result<()>
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreNotifyResult {
     Restored,
     NotOwned,
@@ -697,6 +920,7 @@ mod tests {
         install_stop_hook, is_internal_prompt, read_notify_command, record_prompt_context,
         remove_empty_created_codex_files, remove_prompt_hook, remove_stop_hook,
         restore_notify_command, rollback_integration, set_notify_command,
+        set_notify_command_if_unchanged,
     };
     use crate::paths::AppPaths;
     use std::fs;
@@ -743,6 +967,33 @@ mod tests {
                 "/Applications/codex-notify".to_owned(),
                 "notify".to_owned()
             ])
+        );
+    }
+
+    #[test]
+    fn stale_notify_update_does_not_overwrite_a_switched_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"profile-a\"\nnotify = [\"notifier-a\"]\n",
+        )
+        .expect("write profile A");
+        let profile_a = fs::read(&config_path).expect("snapshot profile A");
+        let profile_b = "model = \"profile-b\"\nnotify = [\"notifier-b\"]\n";
+        fs::write(&config_path, profile_b).expect("switch to profile B");
+
+        let written = set_notify_command_if_unchanged(
+            &config_path,
+            Some(&profile_a),
+            &["codex-notify".to_owned(), "notify".to_owned()],
+        )
+        .expect("conditional update");
+
+        assert!(!written);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read active profile"),
+            profile_b
         );
     }
 
@@ -890,7 +1141,13 @@ mod tests {
         );
         assert_eq!(
             read_notify_command(&paths.codex_config()).expect("read notifier"),
-            Some(vec!["/tmp/codex-notify".to_owned(), "notify".to_owned()])
+            Some(vec![
+                "/tmp/codex-notify".to_owned(),
+                "notify".to_owned(),
+                "--managed".to_owned(),
+                "--forward-notify".to_owned(),
+                "[\"python3\",\"/tmp/previous-notify.py\"]".to_owned(),
+            ])
         );
         assert!(has_prompt_hook(&paths.codex_hooks()).expect("has prompt hook"));
         assert!(has_stop_hook(&paths.codex_hooks()).expect("has Stop hook"));

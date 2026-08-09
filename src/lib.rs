@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod feishu;
 pub mod model;
 pub mod monitor;
+pub mod notify_config;
 pub mod paths;
 pub mod platform;
 pub mod secrets;

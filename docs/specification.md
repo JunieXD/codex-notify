@@ -74,6 +74,7 @@ codex-notify init
 codex-notify test
 codex-notify status
 codex-notify doctor
+codex-notify sync
 codex-notify uninstall
 codex-notify watch
 ```
@@ -111,17 +112,45 @@ Codex's documented `notify` setting accepts one external command and invokes
 it for `agent-turn-complete`. Users may already use that command for Computer
 Use or another notifier.
 
-`codex-notify init` must not overwrite the old command. It must record the
-previous command and install a dispatcher that:
+`codex-notify init` must preserve the old command. A normal notifier becomes a
+self-contained downstream command owned by the dispatcher. A recognized
+Computer Use wrapper remains the outermost command, with `codex-notify notify`
+stored in its `--previous-notify` value. The dispatcher must never forward back
+to Computer Use.
+
+The resulting chain is:
+
+```text
+Codex -> Computer Use (optional) -> codex-notify -> previous notifier (optional)
+```
+
+The dispatcher:
 
 1. Invokes the previous command with the original event input.
-2. Invokes `codex-notify notify` with the same event input.
-3. Captures failures independently so one notifier does not suppress the
+2. Sends the configured provider notification with the same event input.
+3. Captures failures independently so one destination does not suppress the
    other.
 
-`uninstall` must restore the previous command only when the active dispatcher
-is demonstrably owned by `codex-notify`. It must otherwise leave the user's
-configuration untouched and report the manual action needed.
+Computer Use compatibility is guarded because `--previous-notify` is not a
+documented Codex configuration interface. The parser must recognize only
+tested macOS and Windows executable shapes, preserve unrelated wrapper
+arguments, flatten duplicate Computer Use layers, and fail closed on malformed
+or unknown Computer Use commands.
+
+The background watcher must also reconcile notification integration after a
+configuration manager switches the active `config.toml`. Each managed command
+must carry its own previous notifier so profiles cannot use one another's
+downstream command. Atomic writes must follow a symbolic link to its target
+without replacing the link. `sync` exposes the same reconciliation explicitly.
+The per-user background startup entry must persist the application directory
+and `CODEX_HOME` explicitly on both macOS and Windows instead of relying on a
+future login shell to recreate those environment variables.
+
+`uninstall` must recognize both a direct dispatcher and one nested immediately
+inside Computer Use. It restores each known managed configuration independently,
+keeps Computer Use installed, and leaves unrecognized configurations untouched.
+It must stop an already-running background watcher before restoring files so the
+watcher cannot immediately write the managed chain back.
 
 ## 6. Notification Experience
 
