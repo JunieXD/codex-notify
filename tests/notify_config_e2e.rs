@@ -1,7 +1,9 @@
 use codex_notify::codex::{
-    PROMPT_HOOK_MARKER, RestoreNotifyResult, STOP_HOOK_MARKER, managed_notify_command,
-    read_notify_command, restore_notify_command, set_notify_command,
+    PROMPT_HOOK_MARKER, STOP_HOOK_MARKER, managed_notify_command, read_notify_command,
+    set_notify_command,
 };
+#[cfg(unix)]
+use codex_notify::codex::{RestoreNotifyResult, restore_notify_command};
 use codex_notify::paths::AppPaths;
 use codex_notify::settings::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType};
 use std::fs;

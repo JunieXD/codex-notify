@@ -190,7 +190,9 @@ pub fn resolved_write_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType, atomic_write};
+    #[cfg(unix)]
+    use super::atomic_write;
+    use super::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType};
     use crate::paths::AppPaths;
     use tempfile::tempdir;
 
