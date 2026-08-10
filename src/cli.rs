@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
@@ -216,51 +216,81 @@ fn init(arguments: InitArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let existing = AppConfig::load(&paths)?;
     let original_app_config = read_optional_file(&paths.config)?;
+    let theme = ColorfulTheme::default();
+    let interactive = arguments.app_id.is_none()
+        || arguments.app_secret.is_none()
+        || arguments.receiver_id_type.is_none()
+        || arguments.receiver_id.is_none();
+    if interactive {
+        print_init_intro();
+    }
+    if arguments.app_id.is_none() {
+        print_app_id_help();
+    }
     let app_id = input_value(
         arguments.app_id,
         existing
             .as_ref()
             .map(|config| config.feishu.app_id.as_str()),
-        "Feishu App ID",
+        "请输入飞书 App ID",
+        "App ID",
+        validate_app_id,
+        &theme,
     )?;
-    let app_secret = secret_value(arguments.app_secret)?;
+    let app_secret = secret_value(arguments.app_secret, &theme)?;
     let receiver_id_type = receiver_type_value(
         arguments.receiver_id_type,
         existing
             .as_ref()
             .map(|config| config.feishu.receiver_id_type),
+        &theme,
     )?;
+    let receiver_default = existing
+        .as_ref()
+        .filter(|config| config.feishu.receiver_id_type == receiver_id_type)
+        .map(|config| config.feishu.receiver_id.as_str());
+    if arguments.receiver_id.is_none() {
+        print_receiver_help(receiver_id_type);
+    }
     let receiver_id = input_value(
         arguments.receiver_id,
-        existing
-            .as_ref()
-            .map(|config| config.feishu.receiver_id.as_str()),
-        "Feishu receiver ID",
+        receiver_default,
+        receiver_prompt(receiver_id_type),
+        "接收者",
+        |value| validate_receiver_id(receiver_id_type, value),
+        &theme,
     )?;
+    println!("\n[4/4] 确认配置");
+    println!("  App ID：{app_id}");
+    println!(
+        "  接收方式：{}（{}）",
+        receiver_type_name(receiver_id_type),
+        receiver_id_type.as_api_value()
+    );
+    println!("  接收者：{receiver_id}");
+    println!("\n确认后将更新：");
+    println!("  - Codex 通知配置：{}", paths.codex_config().display());
+    println!("  - Codex Hook 配置：{}", paths.codex_hooks().display());
+    println!("  - codex-notify 配置：{}", paths.config.display());
+    println!("  - 后台监听：{}", platform::watcher_location()?);
+    println!("现有 notify 命令和 Hook 会保留；修改前会自动创建备份。");
+    if !arguments.yes
+        && !Confirm::with_theme(&theme)
+            .with_prompt("确认写入配置并启动后台监听吗？")
+            .default(false)
+            .interact()
+            .context("无法读取确认结果")?
+    {
+        println!("已取消，没有修改任何配置。");
+        return Ok(());
+    }
+
     let binary = resolve_binary(arguments.binary)?;
     let feishu = FeishuConfig {
         app_id,
         receiver_id_type,
         receiver_id,
     };
-
-    println!("codex-notify will update:");
-    println!("  - {}", paths.codex_config().display());
-    println!("  - {}", paths.codex_hooks().display());
-    println!("  - {}", paths.config.display());
-    println!("  - {}", platform::watcher_location()?);
-    println!("The existing Codex notify command will be preserved and invoked first.");
-    if !arguments.yes
-        && !Confirm::new()
-            .with_prompt("Continue?")
-            .default(false)
-            .interact()
-            .context("could not read confirmation")?
-    {
-        println!("Canceled without changing configuration.");
-        return Ok(());
-    }
-
     let secrets = KeyringSecretStore;
     let previous_secret = existing
         .as_ref()
@@ -310,33 +340,30 @@ fn init(arguments: InitArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|command| looks_like_feishu_notifier(command))
     {
-        eprintln!(
-            "Warning: the preserved notifier appears to send Feishu messages too; it may create duplicate messages until it is migrated."
-        );
+        eprintln!("提示：保留的旧 notifier 似乎也会发送飞书消息，停用旧通知前可能收到重复提醒。");
     }
-    println!("Codex integration is installed.");
+    println!("\n配置完成，codex-notify 已接入 Codex。");
     if let Some(path) = setup.config_backup {
-        println!("Config backup: {}", path.display());
+        println!("Codex 配置备份：{}", path.display());
     }
     if let Some(path) = setup.hooks_backup {
-        println!("Hooks backup: {}", path.display());
+        println!("Hook 配置备份：{}", path.display());
     }
-    println!("Open /hooks in Codex and trust the new UserPromptSubmit hook before use.");
-    println!("Open /hooks in Codex and trust the new Stop hook before use.");
+    println!("下一步：在 Codex 中运行 /hooks，信任新增的 UserPromptSubmit 和 Stop Hook。");
 
     let should_test = !arguments.skip_test
         && (arguments.yes
-            || Confirm::new()
-                .with_prompt("Send a Feishu test card now?")
+            || Confirm::with_theme(&theme)
+                .with_prompt("现在发送一条飞书测试通知吗？")
                 .default(true)
                 .interact()
-                .context("could not read test confirmation")?);
+                .context("无法读取测试通知确认结果")?);
     if should_test {
         match send_test_for(&config) {
-            Ok(()) => println!("Feishu test card sent."),
+            Ok(()) => println!("飞书测试通知已发送。"),
             Err(error) => {
                 eprintln!(
-                    "Integration is installed, but the test card failed: {error:#}\nRun codex-notify doctor after checking Feishu app permissions."
+                    "配置已经保存，但测试通知发送失败：{error:#}\n请检查飞书应用权限，然后运行 codex-notify doctor。"
                 );
             }
         }
@@ -1144,33 +1171,89 @@ fn configured(paths: &AppPaths) -> Result<AppConfig> {
     AppConfig::load(paths)?.context("codex-notify is not configured; run codex-notify init")
 }
 
-fn input_value(value: Option<String>, default: Option<&str>, label: &str) -> Result<String> {
+fn print_init_intro() {
+    println!("\ncodex-notify 飞书通知配置");
+    println!("--------------------------");
+    println!("接下来会配置飞书应用凭证和通知接收者，完成确认前不会修改任何文件。");
+    println!("请先打开飞书开放平台：https://open.feishu.cn/app");
+    println!("选择企业自建应用后，可在“凭证与基础信息”中找到 App ID 和 App Secret。");
+    println!("如果应用还没有机器人能力和消息权限，请先配置并发布应用。按 Ctrl+C 可随时退出。");
+}
+
+fn print_app_id_help() {
+    println!("\n[1/4] 应用身份");
+    println!("App ID 用于识别你的飞书应用，应以 cli_ 开头。");
+}
+
+fn input_value<F>(
+    value: Option<String>,
+    default: Option<&str>,
+    prompt: &str,
+    field_name: &str,
+    validator: F,
+    theme: &ColorfulTheme,
+) -> Result<String>
+where
+    F: Fn(&str) -> std::result::Result<(), String>,
+{
     let value = match value {
         Some(value) => value,
         None => {
-            let mut input = Input::<String>::new().with_prompt(label);
+            let mut input = Input::<String>::with_theme(theme)
+                .with_prompt(prompt)
+                .validate_with(|input: &String| validator(input.trim()));
             if let Some(default) = default.filter(|value| !value.trim().is_empty()) {
                 input = input.default(default.to_owned());
             }
-            input.interact_text().context("could not read input")?
+            input
+                .interact_text()
+                .with_context(|| format!("无法读取{field_name}"))?
+        }
+    };
+    let value = value.trim();
+    if let Err(error) = validator(value) {
+        bail!("{error}");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_app_id(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("App ID 不能为空，请重新输入。".to_owned());
+    }
+    if !value.starts_with("cli_") {
+        return Err("App ID 应以 cli_ 开头，请确认没有误填 App Secret。".to_owned());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("App ID 不应包含空格，请重新输入。".to_owned());
+    }
+    Ok(())
+}
+
+fn secret_value(value: Option<String>, theme: &ColorfulTheme) -> Result<String> {
+    let value = match value {
+        Some(value) => value,
+        None => {
+            println!("\n[2/4] 应用密钥");
+            println!("App Secret 与 App ID 位于同一页面。粘贴时终端不会显示字符，这是正常现象。");
+            let value = Password::with_theme(theme)
+                .with_prompt("请粘贴 App Secret（输入内容会隐藏）")
+                .allow_empty_password(true)
+                .validate_with(|input: &String| -> std::result::Result<(), &str> {
+                    if input.trim().is_empty() {
+                        Err("App Secret 不能为空，请重新粘贴。")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .interact()
+                .context("无法读取 App Secret")?;
+            println!("App Secret 已收到；稍后会安全保存到系统凭据库，不会写入配置文件。");
+            value
         }
     };
     if value.trim().is_empty() {
-        bail!("{label} must not be empty");
-    }
-    Ok(value.trim().to_owned())
-}
-
-fn secret_value(value: Option<String>) -> Result<String> {
-    let value = match value {
-        Some(value) => value,
-        None => Password::new()
-            .with_prompt("Feishu App Secret")
-            .interact()
-            .context("could not read App Secret")?,
-    };
-    if value.trim().is_empty() {
-        bail!("Feishu App Secret must not be empty");
+        bail!("App Secret 不能为空");
     }
     Ok(value)
 }
@@ -1193,24 +1276,119 @@ fn restore_feishu_secret(
 fn receiver_type_value(
     value: Option<ReceiverIdType>,
     default: Option<ReceiverIdType>,
+    theme: &ColorfulTheme,
 ) -> Result<ReceiverIdType> {
     if let Some(value) = value {
         return Ok(value);
     }
 
-    let default = default.unwrap_or(ReceiverIdType::OpenId);
-    let input = Input::<String>::new()
-        .with_prompt("Feishu receiver ID type (open_id, user_id, email, chat_id)")
-        .default(default.as_api_value().to_owned())
-        .interact_text()
-        .context("could not read receiver ID type")?;
-    match input.trim() {
-        "open_id" => Ok(ReceiverIdType::OpenId),
-        "user_id" => Ok(ReceiverIdType::UserId),
-        "email" => Ok(ReceiverIdType::Email),
-        "chat_id" => Ok(ReceiverIdType::ChatId),
-        _ => bail!("receiver ID type must be open_id, user_id, email, or chat_id"),
+    println!("\n[3/4] 消息接收者");
+    println!("如果不清楚各种 ID 的区别，选择“邮箱”最容易使用。");
+    let options = receiver_type_options();
+    let selection = Select::with_theme(theme)
+        .with_prompt("请选择接收方式（↑/↓ 切换，Enter 确认）")
+        .items(&options)
+        .default(receiver_type_index(
+            default.unwrap_or(ReceiverIdType::Email),
+        ))
+        .interact()
+        .context("无法读取接收方式")?;
+    Ok(receiver_type_from_index(selection))
+}
+
+fn receiver_type_options() -> [&'static str; 4] {
+    [
+        "邮箱（email）— 填写飞书账号可识别的邮箱，最容易上手",
+        "用户 Open ID（open_id）— 形如 ou_xxx，适合私聊",
+        "用户 ID（user_id）— 企业内部定义的成员 ID",
+        "群聊 ID（chat_id）— 形如 oc_xxx，发送到群聊",
+    ]
+}
+
+fn receiver_type_index(value: ReceiverIdType) -> usize {
+    match value {
+        ReceiverIdType::Email => 0,
+        ReceiverIdType::OpenId => 1,
+        ReceiverIdType::UserId => 2,
+        ReceiverIdType::ChatId => 3,
     }
+}
+
+fn receiver_type_from_index(index: usize) -> ReceiverIdType {
+    match index {
+        0 => ReceiverIdType::Email,
+        1 => ReceiverIdType::OpenId,
+        2 => ReceiverIdType::UserId,
+        3 => ReceiverIdType::ChatId,
+        _ => unreachable!("receiver type selection is outside the available options"),
+    }
+}
+
+fn receiver_type_name(value: ReceiverIdType) -> &'static str {
+    match value {
+        ReceiverIdType::Email => "邮箱",
+        ReceiverIdType::OpenId => "用户 Open ID",
+        ReceiverIdType::UserId => "用户 ID",
+        ReceiverIdType::ChatId => "群聊 ID",
+    }
+}
+
+fn print_receiver_help(value: ReceiverIdType) {
+    match value {
+        ReceiverIdType::Email => {
+            println!("填写接收人的飞书账号可识别邮箱，例如 name@example.com。");
+        }
+        ReceiverIdType::OpenId => {
+            println!(
+                "填写形如 ou_xxx 的 Open ID。可通过飞书开放平台“通过手机号或邮箱获取用户 ID”接口查询。"
+            );
+        }
+        ReceiverIdType::UserId => {
+            println!("填写企业通讯录中为成员设置的 User ID；它不是邮箱或 Open ID。");
+        }
+        ReceiverIdType::ChatId => {
+            println!("填写形如 oc_xxx 的群聊 ID；机器人必须已经在该群中。");
+        }
+    }
+}
+
+fn receiver_prompt(value: ReceiverIdType) -> &'static str {
+    match value {
+        ReceiverIdType::Email => "请输入接收通知的飞书账号邮箱",
+        ReceiverIdType::OpenId => "请输入接收人的 Open ID",
+        ReceiverIdType::UserId => "请输入接收人的 User ID",
+        ReceiverIdType::ChatId => "请输入接收通知的群聊 ID",
+    }
+}
+
+fn validate_receiver_id(
+    receiver_type: ReceiverIdType,
+    value: &str,
+) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("接收者不能为空，请重新输入。".to_owned());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("接收者不应包含空格，请重新输入。".to_owned());
+    }
+    match receiver_type {
+        ReceiverIdType::Email => {
+            let valid = value
+                .split_once('@')
+                .is_some_and(|(name, domain)| !name.is_empty() && domain.contains('.'));
+            if !valid {
+                return Err("邮箱格式不正确，请输入完整邮箱，例如 name@example.com。".to_owned());
+            }
+        }
+        ReceiverIdType::OpenId if !value.starts_with("ou_") => {
+            return Err("Open ID 应以 ou_ 开头；如果你想填写邮箱，请返回后选择“邮箱”。".to_owned());
+        }
+        ReceiverIdType::ChatId if !value.starts_with("oc_") => {
+            return Err("群聊 ID 应以 oc_ 开头，请确认复制的是 chat_id。".to_owned());
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn resolve_binary(value: Option<PathBuf>) -> Result<PathBuf> {
@@ -1430,8 +1608,9 @@ fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        acquire_update_lease, acquire_watcher_lease, refresh_existing_installation,
-        remove_directory_tree, request_watcher_stop, wait_for_watcher_exit, watcher_stop_requested,
+        acquire_update_lease, acquire_watcher_lease, receiver_type_from_index, receiver_type_index,
+        refresh_existing_installation, remove_directory_tree, request_watcher_stop,
+        validate_app_id, validate_receiver_id, wait_for_watcher_exit, watcher_stop_requested,
     };
     use crate::paths::AppPaths;
     use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
@@ -1466,6 +1645,35 @@ mod cli_tests {
         remove_directory_tree(&state).expect("remove state tree");
 
         assert!(!state.exists());
+    }
+
+    #[test]
+    fn receiver_menu_indices_round_trip_every_supported_type() {
+        for receiver_type in [
+            ReceiverIdType::Email,
+            ReceiverIdType::OpenId,
+            ReceiverIdType::UserId,
+            ReceiverIdType::ChatId,
+        ] {
+            assert_eq!(
+                receiver_type_from_index(receiver_type_index(receiver_type)),
+                receiver_type
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_field_validation_catches_common_mixups() {
+        assert!(validate_app_id("cli_example").is_ok());
+        assert!(validate_app_id("secret-value").is_err());
+
+        assert!(validate_receiver_id(ReceiverIdType::Email, "owner@example.com").is_ok());
+        assert!(validate_receiver_id(ReceiverIdType::Email, "owner@example").is_err());
+        assert!(validate_receiver_id(ReceiverIdType::OpenId, "ou_example").is_ok());
+        assert!(validate_receiver_id(ReceiverIdType::OpenId, "owner@example.com").is_err());
+        assert!(validate_receiver_id(ReceiverIdType::ChatId, "oc_example").is_ok());
+        assert!(validate_receiver_id(ReceiverIdType::ChatId, "ou_example").is_err());
+        assert!(validate_receiver_id(ReceiverIdType::UserId, "employee-001").is_ok());
     }
 
     #[test]

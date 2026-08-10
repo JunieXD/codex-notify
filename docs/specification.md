@@ -81,7 +81,7 @@ codex-notify watch
 ```
 
 `init` is the primary onboarding path. It must be interactive by default and
-must support a documented non-interactive mode later for automation.
+keep command-line flags available for non-interactive automation.
 
 ### 5.2 `init` flow
 
@@ -97,6 +97,13 @@ must support a documented non-interactive mode later for automation.
 9. Send an opt-in test notification and report its result.
 10. Explain that Codex requires the user to review and trust the new Hooks.
 11. Print a concise status summary.
+
+The interactive flow must use concise Chinese guidance. Before each value it
+explains where to obtain the value and what format to expect. App Secret input
+is hidden and followed by a safe acknowledgement that input was received. The
+receiver type uses a keyboard selection menu with contextual descriptions.
+Invalid input remains at the current prompt with a useful error instead of
+terminating the entire initialization flow.
 
 The Stop Hook never sends an interruption card immediately. It only creates a
 pending candidate, which the watcher confirms using the same rules as a

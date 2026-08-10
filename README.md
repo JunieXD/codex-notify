@@ -70,7 +70,9 @@ irm https://raw.githubusercontent.com/JunieXD/codex-notify/main/scripts/install.
 codex-notify init
 ```
 
-根据提示填写飞书信息并确认修改。初始化完成后，在 Codex 中运行 `/hooks`，信任新增的 `UserPromptSubmit` 和 `Stop` Hook。
+中文向导会说明每项信息的获取位置。App Secret 输入时不会显示内容，接收方式可用方向键选择；填错时可以直接重新输入，无需重新运行命令。确认前不会修改任何文件，确认后会先备份现有配置。
+
+初始化完成后，在 Codex 中运行 `/hooks`，信任新增的 `UserPromptSubmit` 和 `Stop` Hook。
 
 ### 4. 检查是否可用
 
