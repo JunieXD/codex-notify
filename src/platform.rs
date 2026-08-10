@@ -3,15 +3,21 @@
 use anyhow::{Context, Result, bail};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use directories::UserDirs;
+#[cfg(target_os = "windows")]
+use fs2::FileExt;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::fs::OpenOptions;
 #[cfg(target_os = "windows")]
 use std::io::ErrorKind;
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 #[cfg(target_os = "windows")]
@@ -64,6 +70,32 @@ pub fn uninstall_watcher(_paths: &AppPaths) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         uninstall_linux_watcher()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = _paths;
+        bail!("the background watcher is supported on macOS, Windows, and Linux only")
+    }
+}
+
+/// Stop the managed watcher without removing its login/startup configuration.
+///
+/// Updates use this before replacing the executable, then call
+/// [`install_watcher`] after the new binary has refreshed the integration.
+pub fn stop_watcher(_paths: &AppPaths) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        stop_macos_watcher()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows watcher shutdown is coordinated by the stop marker and
+        // process lock in the CLI. The Run entry must remain installed.
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stop_linux_watcher()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
@@ -170,6 +202,27 @@ fn uninstall_macos_watcher() -> Result<()> {
         .status();
     fs::remove_file(&plist_path)
         .with_context(|| format!("could not remove {}", plist_path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_macos_watcher() -> Result<()> {
+    let plist_path = macos_plist_path()?;
+    if !plist_path.exists() {
+        return Ok(());
+    }
+    if !is_managed_macos_plist(&plist_path) {
+        bail!(
+            "refusing to stop user-managed LaunchAgent {}",
+            plist_path.display()
+        );
+    }
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &domain, &plist_path.display().to_string()])
+        .status()
+        .context("could not run launchctl bootout")?;
     Ok(())
 }
 
@@ -290,6 +343,21 @@ fn uninstall_linux_watcher() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn stop_linux_watcher() -> Result<()> {
+    let unit_path = linux_unit_path()?;
+    if !unit_path.exists() {
+        return Ok(());
+    }
+    if !is_managed_linux_unit(&unit_path) {
+        bail!(
+            "refusing to stop user-managed systemd unit {}",
+            unit_path.display()
+        );
+    }
+    run_user_systemctl(&["stop", LINUX_UNIT_NAME])
+}
+
+#[cfg(target_os = "linux")]
 fn run_user_systemctl(arguments: &[&str]) -> Result<()> {
     let status = Command::new("systemctl")
         .arg("--user")
@@ -351,7 +419,63 @@ fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
             WINDOWS_RUN_VALUE,
             &windows_run_command(binary, &paths.root, &paths.codex_home),
         )
-        .context("could not install the codex-notify Windows startup entry")
+        .context("could not install the codex-notify Windows startup entry")?;
+
+    start_windows_watcher(paths, binary)
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    if windows_watcher_running(paths)? {
+        return Ok(());
+    }
+    let mut child = Command::new(binary)
+        .arg("watch")
+        .env("CODEX_NOTIFY_HOME", &paths.root)
+        .env("CODEX_NOTIFY_CODEX_HOME", &paths.codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .with_context(|| format!("could not start watcher {}", binary.display()))?;
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    if let Some(status) = child
+        .try_wait()
+        .context("could not verify the codex-notify Windows watcher")?
+    {
+        if windows_watcher_running(paths)? {
+            return Ok(());
+        }
+        bail!("the codex-notify Windows watcher exited immediately ({status})");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_watcher_running(paths: &AppPaths) -> Result<bool> {
+    let path = paths.state.join("watcher-process.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            Ok(false)
+        }
+        Err(error) if error.kind() == ErrorKind::WouldBlock || error.raw_os_error() == Some(33) => {
+            Ok(true)
+        }
+        Err(error) => Err(error).with_context(|| format!("could not lock {}", path.display())),
+    }
 }
 
 #[cfg(target_os = "windows")]

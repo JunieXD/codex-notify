@@ -90,6 +90,7 @@ codex-notify doctor
 | `codex-notify status` | 查看安装和配置状态 |
 | `codex-notify doctor` | 检查常见配置问题 |
 | `codex-notify sync` | 立即同步当前 `config.toml` 的通知链 |
+| `codex-notify update` | 安全升级到最新版本 |
 | `codex-notify watch --once` | 手动扫描一次中断事件 |
 | `codex-notify uninstall` | 移除集成并恢复原配置 |
 
@@ -137,7 +138,25 @@ CLI 支持配置文件符号链接，写入时会保留链接本身。无法识�
 
 ## 升级与卸载
 
-升级时重新运行对应平台的安装命令即可。
+日常升级直接运行：
+
+```sh
+codex-notify update
+```
+
+只想检查新版本：
+
+```sh
+codex-notify update --check
+```
+
+也可以重新运行[快速开始](#1-安装)中的 curl 或 PowerShell 安装命令。脚本会识别已有安装，并调用同一套安全升级流程。
+
+升级会先下载并校验 SHA-256，再停止后台 watcher、替换程序、刷新现有集成并重新启动。飞书密钥、通知链和已记录的多套 Codex 配置都会保留；升级失败时会自动恢复旧程序和后台服务。
+
+需要安装指定版本时，可运行 `codex-notify update --version vX.Y.Z`。默认不会降级；只有明确加上 `--force` 才允许安装旧版本。
+
+卸载：
 
 ```sh
 codex-notify uninstall

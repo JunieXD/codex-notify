@@ -5,8 +5,8 @@ use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -26,6 +26,10 @@ use crate::paths::AppPaths;
 use crate::platform;
 use crate::secrets::{KeyringSecretStore, SecretStore};
 use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType, atomic_write, resolved_write_path};
+use crate::updater::{
+    self, DEFAULT_REPOSITORY, PreparedRelease, executable_version, install_executable,
+    remove_executable, replace_current_executable,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,6 +54,8 @@ enum Commands {
     Doctor(JsonOutput),
     /// Reapply the integration after another tool switches config.toml.
     Sync,
+    /// Check for updates or safely install a newer release.
+    Update(UpdateArgs),
     /// Restore the previous Codex notifier and remove codex-notify integration.
     Uninstall(UninstallArgs),
     /// Run the local terminal-error watcher.
@@ -69,6 +75,10 @@ enum Commands {
     PromptHook,
     #[command(name = "stop-hook", hide = true)]
     StopHook,
+    #[command(name = "update-finalize", hide = true)]
+    UpdateFinalize(UpdateFinalizeArgs),
+    #[command(name = "install-prepared", hide = true)]
+    InstallPrepared(InstallPreparedArgs),
 }
 
 #[derive(Debug, Args)]
@@ -117,11 +127,59 @@ struct WatchArgs {
     once: bool,
 }
 
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Only report whether an update is available.
+    #[arg(long)]
+    check: bool,
+    /// Install a specific version, such as v0.4.0.
+    #[arg(long)]
+    version: Option<String>,
+    /// GitHub repository to download releases from.
+    #[arg(long, default_value = DEFAULT_REPOSITORY)]
+    repository: String,
+    /// Reinstall the same version or explicitly allow a downgrade.
+    #[arg(long)]
+    force: bool,
+    /// Do not prompt for confirmation.
+    #[arg(short, long)]
+    yes: bool,
+    /// Override the release download directory for end-to-end tests.
+    #[arg(long, hide = true)]
+    download_base: Option<String>,
+    /// Simulate a post-replacement failure for rollback tests.
+    #[arg(long, hide = true)]
+    fail_finalize_for_test: bool,
+}
+
+#[derive(Debug, Args)]
+struct UpdateFinalizeArgs {
+    #[arg(long)]
+    binary: PathBuf,
+    #[arg(long)]
+    restart_watcher: bool,
+    #[arg(long, hide = true)]
+    fail_for_test: bool,
+}
+
+#[derive(Debug, Args)]
+struct InstallPreparedArgs {
+    #[arg(long)]
+    target: PathBuf,
+    #[arg(long)]
+    expected_version: Option<String>,
+    #[arg(long)]
+    force: bool,
+    #[arg(long, hide = true)]
+    fail_finalize_for_test: bool,
+}
+
 const CONFIG_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHER_LOCK_FILENAME: &str = "watcher-process.lock";
 const WATCHER_STOP_FILENAME: &str = "watcher.stop";
+const UPDATE_LOCK_FILENAME: &str = ".codex-notify-update.lock";
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -131,6 +189,7 @@ pub fn run() -> ExitCode {
         Commands::Status(arguments) => status(arguments.json),
         Commands::Doctor(arguments) => doctor(arguments.json),
         Commands::Sync => sync(),
+        Commands::Update(arguments) => update(arguments),
         Commands::Uninstall(arguments) => uninstall(arguments),
         Commands::Watch(arguments) => watch(arguments),
         Commands::Notify {
@@ -140,6 +199,8 @@ pub fn run() -> ExitCode {
         } => notify(event_json, managed, forward_notify),
         Commands::PromptHook => prompt_hook(),
         Commands::StopHook => stop_hook(),
+        Commands::UpdateFinalize(arguments) => update_finalize(arguments),
+        Commands::InstallPrepared(arguments) => install_prepared(arguments),
     };
 
     match result {
@@ -339,6 +400,354 @@ fn sync() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn update(arguments: UpdateArgs) -> Result<()> {
+    let current = updater::current_version()?;
+    println!("Installed version: v{current}");
+    println!("Checking for updates...");
+    let release = updater::resolve_release(
+        &arguments.repository,
+        arguments.version.as_deref(),
+        arguments.download_base.as_deref(),
+    )?;
+    let needed = updater::update_needed(&current, &release.version, arguments.force)?;
+
+    if !needed {
+        println!("codex-notify is already up to date (v{current}).");
+        return Ok(());
+    }
+    if arguments.check {
+        println!("Update available: v{current} -> {}", release.tag);
+        return Ok(());
+    }
+    if !arguments.yes
+        && !Confirm::new()
+            .with_prompt(format!("Install {}?", release.tag))
+            .default(true)
+            .interact()
+            .context("could not read update confirmation")?
+    {
+        println!("Canceled without changing the installed version.");
+        return Ok(());
+    }
+
+    let paths = AppPaths::discover()?;
+    let current_executable = resolve_binary(None)?;
+    let _update_lease = acquire_update_lease(&current_executable)?;
+    let staging_parent = current_executable
+        .parent()
+        .context("the installed executable does not have a parent directory")?;
+    println!("Downloading and verifying {}...", release.tag);
+    let prepared = updater::prepare_release(release, staging_parent)?;
+    let target_tag = prepared.info.tag.clone();
+    apply_self_update(
+        &paths,
+        &current_executable,
+        prepared,
+        arguments.fail_finalize_for_test,
+    )?;
+    println!("Updated codex-notify from v{current} to {target_tag}.");
+    Ok(())
+}
+
+fn apply_self_update(
+    paths: &AppPaths,
+    current_executable: &Path,
+    prepared: PreparedRelease,
+    fail_finalize_for_test: bool,
+) -> Result<()> {
+    let restart_watcher = platform::is_watcher_installed(paths)?;
+    if let Err(error) = stop_watcher_for_update(paths) {
+        return Err(with_recovery(
+            error,
+            resume_watcher_after_update(paths, current_executable, restart_watcher),
+        ));
+    }
+
+    let backup = match prepared.backup_current_executable(current_executable) {
+        Ok(backup) => backup,
+        Err(error) => {
+            return Err(with_recovery(
+                error,
+                resume_watcher_after_update(paths, current_executable, restart_watcher),
+            ));
+        }
+    };
+    if let Err(error) = replace_current_executable(&prepared.executable) {
+        return Err(with_recovery(
+            error,
+            resume_watcher_after_update(paths, current_executable, restart_watcher),
+        ));
+    }
+
+    let finalize_result =
+        run_update_finalize(current_executable, restart_watcher, fail_finalize_for_test);
+    if let Err(finalize_error) = finalize_result {
+        let executable_recovery = install_executable(backup.path(), current_executable)
+            .context("could not restore the previous executable");
+        let watcher_recovery =
+            resume_watcher_after_update(paths, current_executable, restart_watcher);
+        let recovery = combine_recovery_steps(executable_recovery, watcher_recovery);
+        return Err(with_recovery(finalize_error, recovery));
+    }
+    Ok(())
+}
+
+fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
+    let source = resolve_binary(None)?;
+    let source_version = updater::current_version()?;
+    if let Some(expected) = arguments.expected_version.as_deref() {
+        let expected = updater::parse_version(expected)?;
+        if expected != source_version {
+            bail!("the downloaded executable is v{source_version}, but v{expected} was requested");
+        }
+    }
+
+    let target = absolute_path(&arguments.target)?;
+    if source == target {
+        bail!("the prepared executable and installation target are the same file");
+    }
+    let installed_version = target
+        .exists()
+        .then(|| executable_version(&target))
+        .transpose();
+    match installed_version.as_ref() {
+        Ok(Some(installed)) => {
+            if !updater::update_needed(installed, &source_version, arguments.force)? {
+                println!("codex-notify is already up to date (v{installed}).");
+                return Ok(());
+            }
+            println!("Upgrading codex-notify from v{installed} to v{source_version}...");
+        }
+        Ok(None) => println!("Installing codex-notify v{source_version}..."),
+        Err(error) => {
+            eprintln!(
+                "Warning: the existing executable could not report its version; it will be repaired: {error:#}"
+            );
+        }
+    }
+
+    let paths = AppPaths::discover()?;
+    let target_parent = target
+        .parent()
+        .context("the installation target does not have a parent directory")?;
+    fs::create_dir_all(target_parent)
+        .with_context(|| format!("could not create {}", target_parent.display()))?;
+    let _update_lease = acquire_update_lease(&target)?;
+    let existing_config = AppConfig::load(&paths)?;
+    // A watcher launcher is user-global on every supported platform. It may
+    // belong to another CODEX_NOTIFY_HOME, so it must not turn an otherwise
+    // standalone first install into a coordinated upgrade.
+    let coordinated_upgrade = target.exists() || existing_config.is_some();
+    let restart_watcher = coordinated_upgrade && platform::is_watcher_installed(&paths)?;
+    let previous_binary = existing_config
+        .as_ref()
+        .and_then(|config| config.installation.managed_notify.first())
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| target.clone());
+    let backup_directory = tempfile::Builder::new()
+        .prefix("codex-notify-installer-backup-")
+        .tempdir_in(target_parent)
+        .with_context(|| {
+            format!(
+                "could not create an installer rollback directory in {}",
+                target_parent.display()
+            )
+        })?;
+    let backup = target.exists().then(|| {
+        let path = backup_directory.path().join(if cfg!(windows) {
+            "codex-notify.previous.exe"
+        } else {
+            "codex-notify.previous"
+        });
+        fs::copy(&target, &path)
+            .with_context(|| format!("could not back up {}", target.display()))?;
+        Ok::<_, anyhow::Error>(path)
+    });
+    let backup = backup.transpose()?;
+
+    if coordinated_upgrade {
+        if let Err(error) = stop_watcher_for_update(&paths) {
+            return Err(with_recovery(
+                error,
+                resume_watcher_after_update(&paths, &previous_binary, restart_watcher),
+            ));
+        }
+    }
+    if let Err(error) = install_executable(&source, &target) {
+        let recovery = if coordinated_upgrade {
+            resume_watcher_after_update(&paths, &previous_binary, restart_watcher)
+        } else {
+            Ok(())
+        };
+        return Err(with_recovery(error, recovery));
+    }
+
+    if let Err(error) = executable_version(&target).and_then(|installed| {
+        if installed == source_version {
+            Ok(())
+        } else {
+            bail!("the installed executable reported v{installed}, expected v{source_version}")
+        }
+    }) {
+        let recovery = restore_installer_update(
+            &paths,
+            &target,
+            backup.as_deref(),
+            &previous_binary,
+            restart_watcher,
+            coordinated_upgrade,
+        );
+        return Err(with_recovery(error, recovery));
+    }
+
+    if coordinated_upgrade {
+        if let Err(error) =
+            run_update_finalize(&target, restart_watcher, arguments.fail_finalize_for_test)
+        {
+            let recovery = restore_installer_update(
+                &paths,
+                &target,
+                backup.as_deref(),
+                &previous_binary,
+                restart_watcher,
+                true,
+            );
+            return Err(with_recovery(error, recovery));
+        }
+        println!("codex-notify was upgraded safely to v{source_version}.");
+    } else {
+        println!("Installed codex-notify to {}", target.display());
+    }
+    Ok(())
+}
+
+fn restore_installer_update(
+    paths: &AppPaths,
+    target: &Path,
+    backup: Option<&Path>,
+    previous_binary: &Path,
+    restart_watcher: bool,
+    coordinated_upgrade: bool,
+) -> Result<()> {
+    let executable_recovery = match backup {
+        Some(backup) => {
+            install_executable(backup, target).context("could not restore the previous executable")
+        }
+        None => remove_executable(target)
+            .with_context(|| format!("could not remove {}", target.display())),
+    };
+    let watcher_recovery = if coordinated_upgrade {
+        resume_watcher_after_update(paths, previous_binary, restart_watcher)
+    } else {
+        Ok(())
+    };
+    combine_recovery_steps(executable_recovery, watcher_recovery)
+}
+
+fn update_finalize(arguments: UpdateFinalizeArgs) -> Result<()> {
+    if arguments.fail_for_test {
+        bail!("simulated update finalization failure");
+    }
+    let paths = AppPaths::discover()?;
+    let binary = fs::canonicalize(&arguments.binary).with_context(|| {
+        format!(
+            "could not resolve installed executable {}",
+            arguments.binary.display()
+        )
+    })?;
+    refresh_existing_installation(&paths, &binary, arguments.restart_watcher)
+}
+
+fn refresh_existing_installation(
+    paths: &AppPaths,
+    binary: &Path,
+    restart_watcher: bool,
+) -> Result<()> {
+    let Some(existing) = AppConfig::load(paths)? else {
+        clear_watcher_stop_request(paths)?;
+        if restart_watcher {
+            platform::install_watcher(paths, binary)?;
+        }
+        return Ok(());
+    };
+    let original_app_config = read_optional_file(&paths.config)?;
+    let setup = install_integration(paths, binary, Some(&existing.installation))?;
+    let updated = AppConfig::new(existing.feishu, setup.installation.clone());
+    let result = (|| {
+        updated.save(paths)?;
+        clear_watcher_stop_request(paths)?;
+        if restart_watcher {
+            platform::install_watcher(paths, binary)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let recovery = (|| {
+            rollback_integration(paths, &setup)?;
+            restore_optional_file(&paths.config, original_app_config.as_deref())
+        })();
+        return Err(with_recovery(error, recovery));
+    }
+    Ok(())
+}
+
+fn run_update_finalize(
+    executable: &Path,
+    restart_watcher: bool,
+    fail_for_test: bool,
+) -> Result<()> {
+    let mut command = Command::new(executable);
+    command
+        .arg("update-finalize")
+        .arg("--binary")
+        .arg(executable);
+    if restart_watcher {
+        command.arg("--restart-watcher");
+    }
+    if fail_for_test {
+        command.arg("--fail-for-test");
+    }
+    let status = command.status().with_context(|| {
+        format!(
+            "could not start the updated executable {}",
+            executable.display()
+        )
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("the updated executable could not finalize the upgrade ({status})")
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("could not determine the current directory")?
+        .join(path))
+}
+
+fn with_recovery(error: anyhow::Error, recovery: Result<()>) -> anyhow::Error {
+    match recovery {
+        Ok(()) => error,
+        Err(recovery_error) => anyhow::anyhow!(
+            "{error:#}; restoring the previous installation also failed: {recovery_error:#}"
+        ),
+    }
+}
+
+fn combine_recovery_steps(first: Result<()>, second: Result<()>) -> Result<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => {
+            bail!("{first:#}; restoring the watcher also failed: {second:#}")
+        }
+    }
 }
 
 fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json::Value> {
@@ -855,6 +1264,13 @@ fn watcher_stop_path(paths: &AppPaths) -> PathBuf {
     paths.state.join(WATCHER_STOP_FILENAME)
 }
 
+fn update_lock_path(executable: &Path) -> Result<PathBuf> {
+    let parent = executable
+        .parent()
+        .context("the update target does not have a parent directory")?;
+    Ok(parent.join(UPDATE_LOCK_FILENAME))
+}
+
 fn acquire_watcher_lease(paths: &AppPaths) -> Result<File> {
     paths.ensure_directories()?;
     let path = watcher_lock_path(paths);
@@ -868,6 +1284,24 @@ fn acquire_watcher_lease(paths: &AppPaths) -> Result<File> {
     file.try_lock_exclusive().with_context(|| {
         format!(
             "another codex-notify watcher is already using {}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn acquire_update_lease(executable: &Path) -> Result<File> {
+    let path = update_lock_path(executable)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "another codex-notify update is already running; wait for it to finish ({})",
             path.display()
         )
     })?;
@@ -896,6 +1330,27 @@ fn request_watcher_stop(paths: &AppPaths) -> Result<()> {
             path.display()
         )
     })
+}
+
+fn stop_watcher_for_update(paths: &AppPaths) -> Result<()> {
+    request_watcher_stop(paths)?;
+    if let Err(error) = platform::stop_watcher(paths) {
+        let _ = clear_watcher_stop_request(paths);
+        return Err(error).context("could not stop the background watcher for the update");
+    }
+    wait_for_watcher_exit(paths).context("could not stop the background watcher for the update")
+}
+
+fn resume_watcher_after_update(
+    paths: &AppPaths,
+    binary: &Path,
+    restart_watcher: bool,
+) -> Result<()> {
+    clear_watcher_stop_request(paths)?;
+    if restart_watcher {
+        platform::install_watcher(paths, binary)?;
+    }
+    Ok(())
 }
 
 fn is_lock_contended(error: &std::io::Error) -> bool {
@@ -935,7 +1390,7 @@ fn wait_for_watcher_exit(paths: &AppPaths) -> Result<()> {
             Err(error) if is_lock_contended(&error) => {
                 if Instant::now() >= deadline {
                     bail!(
-                        "the background watcher did not stop within {} seconds; retry uninstall",
+                        "the background watcher did not stop within {} seconds; retry the operation",
                         WATCHER_SHUTDOWN_TIMEOUT.as_secs()
                     );
                 }
@@ -975,10 +1430,11 @@ fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        acquire_watcher_lease, remove_directory_tree, request_watcher_stop, wait_for_watcher_exit,
-        watcher_stop_requested,
+        acquire_update_lease, acquire_watcher_lease, refresh_existing_installation,
+        remove_directory_tree, request_watcher_stop, wait_for_watcher_exit, watcher_stop_requested,
     };
     use crate::paths::AppPaths;
+    use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
     use std::fs;
     use std::thread;
     use std::time::Duration;
@@ -1027,5 +1483,71 @@ mod cli_tests {
         request_watcher_stop(&paths).expect("request stop");
         wait_for_watcher_exit(&paths).expect("wait for watcher");
         watcher.join().expect("join watcher");
+    }
+
+    #[test]
+    fn concurrent_updates_are_rejected_until_the_lease_is_released() {
+        let (_app_home, _codex_home, paths) = paths();
+        let executable = paths.root.join("bin").join("codex-notify");
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create executable parent");
+        let first = acquire_update_lease(&executable).expect("first update lease");
+
+        let error = acquire_update_lease(&executable).expect_err("second update must be rejected");
+        assert!(error.to_string().contains("another codex-notify update"));
+
+        drop(first);
+        acquire_update_lease(&executable).expect("lease after release");
+    }
+
+    #[test]
+    fn update_refresh_preserves_feishu_and_previous_notify_configuration() {
+        let (_app_home, _codex_home, paths) = paths();
+        paths.ensure_directories().expect("application directories");
+        fs::write(
+            paths.codex_config(),
+            "notify = [\"existing-notifier\", \"--keep\"]\n",
+        )
+        .expect("initial Codex config");
+        let old_binary = paths.root.join("old-codex-notify");
+        let new_binary = paths.root.join("new-codex-notify");
+        fs::write(&old_binary, b"old").expect("old binary marker");
+        fs::write(&new_binary, b"new").expect("new binary marker");
+        let setup = crate::codex::install_integration(&paths, &old_binary, None)
+            .expect("initial integration");
+        let feishu = FeishuConfig {
+            app_id: "cli_update_test".to_owned(),
+            receiver_id_type: ReceiverIdType::Email,
+            receiver_id: "owner@example.com".to_owned(),
+        };
+        AppConfig::new(feishu.clone(), setup.installation)
+            .save(&paths)
+            .expect("initial app config");
+
+        refresh_existing_installation(&paths, &new_binary, false).expect("refresh integration");
+
+        let updated = AppConfig::load(&paths)
+            .expect("load updated config")
+            .expect("configured");
+        assert_eq!(updated.feishu, feishu);
+        assert_eq!(
+            updated.installation.previous_notify,
+            Some(vec!["existing-notifier".to_owned(), "--keep".to_owned()])
+        );
+        assert_eq!(
+            updated.installation.managed_notify.first(),
+            Some(&new_binary.to_string_lossy().into_owned())
+        );
+        assert!(
+            updated
+                .installation
+                .managed_binary_paths
+                .contains(&old_binary.to_string_lossy().into_owned())
+        );
+        let codex_config = fs::read_to_string(paths.codex_config()).expect("Codex config");
+        assert!(codex_config.contains("existing-notifier"));
+        assert!(codex_config.contains(new_binary.to_string_lossy().as_ref()));
+        let hooks = fs::read_to_string(paths.codex_hooks()).expect("Codex hooks");
+        assert!(hooks.contains(new_binary.to_string_lossy().as_ref()));
     }
 }

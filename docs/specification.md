@@ -544,6 +544,16 @@ The initial installation channels are:
 2. A Homebrew tap for macOS.
 3. A Scoop manifest for Windows.
 
+Installed standalone binaries expose `codex-notify update`. The command and
+the first-party install scripts share one update transaction: resolve a
+release, verify its `SHA256SUMS` entry and staged version, stop (but do not
+uninstall) the watcher, replace the executable, refresh the existing
+integration without reading or replacing the Feishu secret, restart the
+watcher, and verify the new process. Any failure after replacement restores
+the previous executable and watcher. Re-running an install script delegates to
+this command when available; a downloaded newer binary performs the same
+transaction when upgrading a legacy installation.
+
 winget and crates.io publication are later milestones, after the installer,
 upgrade, signing, and compatibility behavior are stable.
 
