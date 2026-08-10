@@ -27,7 +27,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-确认 `docs/releases/vX.Y.Z.md` 简洁说明了用户能感知的新增功能、体验优化和问题修复。
+确认 `docs/releases/vX.Y.Z.md` 简洁说明了用户能感知的新增功能、体验优化和问题修复。分类标题和正文使用纯文本，不添加装饰性 emoji。
 
 ## 3. 发布
 

@@ -1,6 +1,6 @@
 ---
 name: write-release-notes
-description: Write and validate concise Chinese release announcements for codex-notify from the Git differences between a target version and its previous version tag. Use before creating a version tag or GitHub Release, or when asked to draft, update, or check docs/releases/v*.md. Do not use for generic commit messages or engineering-only changelogs.
+description: Write and validate concise Chinese release announcements without decorative emoji for codex-notify from the Git differences between a target version and its previous version tag. Use before creating a version tag or GitHub Release, or when asked to draft, update, or check docs/releases/v*.md. Do not use for generic commit messages or engineering-only changelogs.
 ---
 
 # 撰写更新公告
@@ -38,6 +38,8 @@ description: Write and validate concise Chinese release announcements for codex-
 
 - 开头用一句话说明本次更新最重要的用户价值。
 - 只保留有内容的分类：`新增功能`、`体验优化`、`问题修复`、`重要变化`。
+- 分类标题只使用纯文本，如 `## 问题修复`，不要添加 emoji。
+- 正文也不要使用装饰性 emoji，保持清晰克制。
 - 每条只表达一个变化，优先使用“现在可以……”“不再……”等直接说法。
 - 合并同一功能的多个提交；不要出现提交哈希、文件名、内部里程碑或 CI 维护细节。
 - 说明必要的兼容性、配置或升级动作；破坏性变化必须放在最前面。

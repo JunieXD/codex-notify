@@ -13,13 +13,16 @@ from pathlib import Path
 
 SEMVER_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
 PLACEHOLDER_RE = re.compile(r"\b(?:TODO|TBD)\b|待补充|请填写|一句话说明")
-UPDATE_HEADINGS = (
-    "## ✨ 新增功能",
-    "## 💡 体验优化",
-    "## 🛠️ 问题修复",
-    "## ⚠️ 重要变化",
+DECORATIVE_EMOJI_RE = re.compile(
+    r"[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF]"
 )
-INSTALL_HEADING = "## 📦 安装与升级"
+UPDATE_HEADINGS = (
+    "## 新增功能",
+    "## 体验优化",
+    "## 问题修复",
+    "## 重要变化",
+)
+INSTALL_HEADING = "## 安装与升级"
 
 
 class ReleaseNotesError(RuntimeError):
@@ -130,21 +133,29 @@ def announcement_template(version: str) -> str:
 
 一句话说明这次更新能为用户带来什么。
 
-## ✨ 新增功能
+## 新增功能
 
 - TODO：说明用户现在可以完成什么。
 
-## 💡 体验优化
+## 体验优化
 
 - TODO：说明哪些操作变得更简单或更可靠。
 
-## 🛠️ 问题修复
+## 问题修复
 
 - TODO：说明修复了哪些会影响用户的问题。
 
-## 📦 安装与升级
+## 安装与升级
 
-### macOS
+已有用户可直接升级：
+
+```sh
+codex-notify update
+```
+
+首次安装可使用以下命令。
+
+### macOS 与 Linux
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JunieXD/codex-notify/main/scripts/install.sh | sh
@@ -156,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/JunieXD/codex-notify/main/scripts/i
 irm https://raw.githubusercontent.com/JunieXD/codex-notify/main/scripts/install.ps1 | iex
 ```
 
-安装完成后运行 `codex-notify init`；已有用户重新运行安装命令即可升级。
+安装完成后运行 `codex-notify init` 开始配置。
 """
 
 
@@ -212,10 +223,16 @@ def validate_notes(root: Path, version: str) -> Path:
         errors.append("缺少格式正确的发布日期")
     if PLACEHOLDER_RE.search(markdown):
         errors.append("仍有 TODO 或占位文案")
+    if DECORATIVE_EMOJI_RE.search(markdown):
+        errors.append("请移除装饰性 emoji，分类标题和正文应使用纯文本")
+
+    structure_markdown = DECORATIVE_EMOJI_RE.sub("", markdown)
+    structure_markdown = structure_markdown.replace("\ufe0f", "").replace("\u200d", "")
+    structure_markdown = re.sub(r"^##\s+", "## ", structure_markdown, flags=re.MULTILINE)
 
     present_updates = 0
     for heading in UPDATE_HEADINGS:
-        body = section_body(markdown, heading)
+        body = section_body(structure_markdown, heading)
         if body is None:
             continue
         present_updates += 1
@@ -224,7 +241,7 @@ def validate_notes(root: Path, version: str) -> Path:
     if present_updates == 0:
         errors.append("至少保留一个更新分类")
 
-    install_body = section_body(markdown, INSTALL_HEADING)
+    install_body = section_body(structure_markdown, INSTALL_HEADING)
     if install_body is None or "codex-notify" not in install_body:
         errors.append("缺少可执行的安装或升级说明")
     if not markdown.endswith("\n"):
