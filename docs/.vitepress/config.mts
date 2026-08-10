@@ -11,6 +11,22 @@ export default defineConfig({
   sitemap: {
     hostname: 'https://juniexd.github.io/codex-notify/'
   },
+  markdown: {
+    config(md) {
+      const defaultFenceRenderer = md.renderer.rules.fence
+      md.renderer.rules.fence = (tokens, index, options, environment, renderer) => {
+        const token = tokens[index]
+        if (token.info.trim().split(/\s+/, 1)[0] === 'mermaid') {
+          const source = encodeURIComponent(token.content)
+          return `<MermaidDiagram source="${source}" />`
+        }
+
+        return defaultFenceRenderer
+          ? defaultFenceRenderer(tokens, index, options, environment, renderer)
+          : renderer.renderToken(tokens, index, options)
+      }
+    }
+  },
   vite: {
     publicDir: '../assets'
   },

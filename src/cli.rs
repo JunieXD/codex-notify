@@ -185,6 +185,7 @@ const UPDATE_LOCK_FILENAME: &str = ".codex-notify-update.lock";
 const ROOT_HELP_TEMPLATE: &str = "{before-help}{about-with-newline}\n用法：{usage}\n\n命令：\n{subcommands}\n选项：\n{options}{after-help}";
 const COMMAND_HELP_TEMPLATE: &str =
     "{before-help}{about-with-newline}\n用法：{usage}\n\n选项：\n{options}{after-help}";
+const FEISHU_SETUP_GUIDE_URL: &str = "https://juniexd.github.io/codex-notify/guide/feishu-setup";
 const HOOK_TRUST_GUIDANCE: &str = "还差一步：信任两个用户 Hook\n\
 如果你使用 ChatGPT App（原 Codex App）：\n\
   1. 打开“设置”，进入“钩子”。\n\
@@ -1378,6 +1379,7 @@ fn print_init_intro(reconfiguring: bool) {
     }
     println!("--------------------------");
     println!("接下来会填写飞书应用凭证和通知接收者，完成最终确认前不会修改任何文件。");
+    println!("第一次配置飞书应用？请按教程逐步操作：{FEISHU_SETUP_GUIDE_URL}");
     println!("请先打开飞书开放平台：https://open.feishu.cn/app");
     println!("选择企业自建应用后，可在“凭证与基础信息”中找到 App ID 和 App Secret。");
     println!("如果应用还没有机器人能力和消息权限，请先配置并发布应用。按 Ctrl+C 可随时退出。");
@@ -1817,7 +1819,7 @@ fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease,
+        FEISHU_SETUP_GUIDE_URL, HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease,
         existing_configuration_summary, localized_cli_command, receiver_type_from_index,
         receiver_type_index, refresh_existing_installation, remove_directory_tree,
         request_watcher_stop, validate_app_id, validate_receiver_id, wait_for_watcher_exit,
@@ -1895,6 +1897,14 @@ mod cli_tests {
         assert!(HOOK_TRUST_GUIDANCE.contains("“用户”区域"));
         assert!(HOOK_TRUST_GUIDANCE.contains("UserPromptSubmit"));
         assert!(HOOK_TRUST_GUIDANCE.contains("Stop"));
+    }
+
+    #[test]
+    fn feishu_setup_guide_uses_the_public_documentation_url() {
+        assert_eq!(
+            FEISHU_SETUP_GUIDE_URL,
+            "https://juniexd.github.io/codex-notify/guide/feishu-setup"
+        );
     }
 
     #[test]
