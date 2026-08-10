@@ -35,7 +35,7 @@ codex-notify test
 
 ## 测试通知正常，但 Codex 完成后没有消息
 
-通常是 Hook 尚未信任或当前 `config.toml` 没有接入通知链。
+通常是后台 watcher 没有运行、Hook 尚未信任，或当前 `config.toml` 没有接入通知链。
 
 1. 在 ChatGPT App 的“设置” → “钩子”中信任 `UserPromptSubmit` 和 `Stop`；Codex CLI 用户运行 `/hooks`。
 2. 运行 `codex-notify doctor` 查看通知链。
@@ -44,6 +44,8 @@ codex-notify test
    ```sh
    codex-notify sync
    ```
+
+升级 `codex-notify` 后不需要重启 ChatGPT。已经打开的旧任务会由 watcher 从本地任务记录补获；如果 `doctor` 显示后台监听异常，请先修复 watcher。
 
 ## 切换配置后通知失效
 

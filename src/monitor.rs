@@ -14,24 +14,29 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::codex::{CompletionEvent, completion_notification, is_internal_prompt};
 use crate::model::Notification;
 use crate::paths::AppPaths;
 use crate::settings::atomic_write;
-use crate::state::{elapsed_since, find_thread_title, load_turn_state};
+use crate::state::{elapsed_since, find_thread_title, load_turn_state, remove_turn_state};
 use crate::transcript::{
-    JsonlTranscriptSource, TerminalError, TranscriptEventKind, TranscriptSource,
+    JsonlTranscriptSource, TaskCompletion, TerminalError, TranscriptEventKind, TranscriptSource,
 };
 
-pub const WATCH_INTERVAL: Duration = Duration::from_secs(30);
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const INITIAL_LOOKBACK: Duration = Duration::from_secs(10 * 60);
+const COMPLETION_TITLE_WAIT: Duration = Duration::from_secs(5);
 const TERMINAL_CONFIRMATION: Duration = Duration::from_secs(30);
 const ACTIVE_GOAL_STALL: Duration = Duration::from_secs(10 * 60);
 const MAX_TRANSCRIPT_AGE: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 const MAX_SEEN_EVENTS: usize = 4_096;
 const MAX_COMPLETED_TURNS: usize = 4_096;
+const MAX_DELIVERED_TURNS: usize = 4_096;
+const MAX_PENDING_COMPLETIONS: usize = 256;
 const MAX_CONFIRMING: usize = 128;
 const MAX_PROMPTS_PER_FILE: usize = 128;
 const DELIVERY_LEASE: Duration = Duration::from_secs(60);
+const MONITOR_STATE_VERSION: u32 = 1;
 const GOAL_FAILURE_STATUSES: &[&str] = &["blocked", "usage_limited", "budget_limited"];
 const GOAL_STOP_STATUSES: &[&str] = &["paused", "complete"];
 
@@ -44,6 +49,7 @@ pub struct PendingDelivery {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchSummary {
     pub scanned_files: usize,
+    pub new_completions: usize,
     pub new_candidates: usize,
     pub canceled_candidates: usize,
     pub pending_deliveries: usize,
@@ -52,11 +58,19 @@ pub struct WatchSummary {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MonitorState {
     #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    needs_initial_scan: bool,
+    #[serde(default)]
     files: BTreeMap<String, FileCursor>,
     #[serde(default)]
     seen: Vec<String>,
     #[serde(default)]
     completed_turns: Vec<String>,
+    #[serde(default)]
+    delivered_turns: Vec<String>,
+    #[serde(default)]
+    pending_completions: Vec<CompletionCandidate>,
     #[serde(default)]
     confirming: Vec<Candidate>,
 }
@@ -81,6 +95,30 @@ struct PromptSnapshot {
     turn_id: String,
     #[serde(default)]
     prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompletionCandidate {
+    key: String,
+    #[serde(default)]
+    turn_id: String,
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    task: String,
+    #[serde(default)]
+    details: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    conversation_title: String,
+    #[serde(default)]
+    duration_seconds: Option<u64>,
+    #[serde(default)]
+    completed_at_seconds: Option<u64>,
+    detected_at_seconds: u64,
+    #[serde(default)]
+    delivery_started_at_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,25 +200,72 @@ pub fn prepare_notifications(
         state.files.retain(|path, _| active_paths.contains(path));
         apply_stop_hook_goal_context(state);
 
-        let deliveries =
-            confirm_candidates(paths, state, now_seconds, &mut summary, &transcript_source)?;
+        let mut deliveries = prepare_completion_deliveries(paths, state, now_seconds)?;
+        deliveries.extend(confirm_candidates(
+            paths,
+            state,
+            now_seconds,
+            &mut summary,
+            &transcript_source,
+        )?);
+        state.needs_initial_scan = false;
         prune_state(state);
         summary.pending_deliveries = deliveries.len();
         Ok((summary, deliveries))
     })
 }
 
-/// Mark a planned Feishu delivery as successful or retryable. A short delivery
-/// lease prevents two concurrently started watcher processes from sending the
-/// same card while the first one is awaiting the network.
-pub fn settle_delivery(paths: &AppPaths, key: &str, delivered: bool) -> Result<()> {
+/// Persist a documented `agent-turn-complete` event and return immediately.
+/// The watcher sends it after Codex has had a chance to generate the title.
+pub fn enqueue_completion(
+    paths: &AppPaths,
+    event: &CompletionEvent,
+    now: SystemTime,
+) -> Result<bool> {
+    if !event.is_completion() || event.is_internal() {
+        return Ok(false);
+    }
+    let now_seconds = unix_seconds(now);
+    let candidate = completion_from_event(paths, event, now_seconds);
     with_state(paths, |state, _| {
+        Ok(add_completion_candidate(state, candidate))
+    })
+}
+
+/// Mark a planned Feishu delivery as successful or retryable. A short delivery
+/// lease prevents duplicates while a provider request is in flight and spaces
+/// out retries after a failed request.
+pub fn settle_delivery(paths: &AppPaths, key: &str, delivered: bool) -> Result<()> {
+    let completed_turn = with_state(paths, |state, _| {
+        if let Some(index) = state
+            .pending_completions
+            .iter()
+            .position(|candidate| candidate.key == key)
+        {
+            if delivered {
+                let candidate = state.pending_completions.remove(index);
+                if !candidate.turn_id.is_empty() {
+                    add_bounded(
+                        &mut state.delivered_turns,
+                        candidate.turn_id.clone(),
+                        MAX_DELIVERED_TURNS,
+                    );
+                }
+                prune_state(state);
+                return Ok((!candidate.turn_id.is_empty()).then_some(candidate.turn_id));
+            }
+            // Keep the lease timestamp so a temporary provider failure does
+            // not cause a tight retry loop on the next one-second scan.
+            prune_state(state);
+            return Ok(None);
+        }
+
         let Some(index) = state
             .confirming
             .iter()
             .position(|candidate| candidate.key == key)
         else {
-            return Ok(());
+            return Ok(None);
         };
         if delivered {
             let candidate = state.confirming.remove(index);
@@ -190,12 +275,14 @@ pub fn settle_delivery(paths: &AppPaths, key: &str, delivered: bool) -> Result<(
                     .confirming
                     .retain(|other| other.turn_id != candidate.turn_id);
             }
-        } else if let Some(candidate) = state.confirming.get_mut(index) {
-            candidate.delivery_started_at_seconds = None;
         }
         prune_state(state);
-        Ok(())
-    })
+        Ok(None)
+    })?;
+    if let Some(turn_id) = completed_turn {
+        remove_turn_state(&paths.state, &turn_id)?;
+    }
+    Ok(())
 }
 
 /// A documented normal-completion notify event outranks a speculative Stop
@@ -206,14 +293,7 @@ pub fn mark_turn_completed(paths: &AppPaths, turn_id: &str) -> Result<()> {
         return Ok(());
     }
     with_state(paths, |state, _| {
-        add_bounded(
-            &mut state.completed_turns,
-            turn_id.to_owned(),
-            MAX_COMPLETED_TURNS,
-        );
-        state
-            .confirming
-            .retain(|candidate| candidate.turn_id != turn_id);
+        remember_completed_turn(state, turn_id);
         Ok(())
     })
 }
@@ -342,6 +422,29 @@ fn scan_file(
                 remember_prompt(&mut cursor, prompt.turn_id, prompt.prompt)
             }
             TranscriptEventKind::TaskStarted => {}
+            TranscriptEventKind::TaskCompleted(completion) => {
+                if !should_consider_completion(
+                    &completion,
+                    context.first_run || is_new_file,
+                    context.now_seconds,
+                ) {
+                    remember_completed_turn(state, &completion.turn_id);
+                    continue;
+                }
+                let candidate = completion_from_transcript(
+                    context.paths,
+                    &cursor,
+                    completion,
+                    context.now_seconds,
+                );
+                if is_internal_prompt(&candidate.task) {
+                    remember_completed_turn(state, &candidate.turn_id);
+                    continue;
+                }
+                if add_completion_candidate(state, candidate) {
+                    summary.new_completions += 1;
+                }
+            }
             TranscriptEventKind::GoalStatus(status) => cursor.goal_status = status,
             TranscriptEventKind::TerminalError(error) => {
                 if !should_consider_error(
@@ -359,7 +462,7 @@ fn scan_file(
                     error,
                     context.now_seconds,
                 );
-                if crate::codex::is_internal_prompt(&candidate.task) {
+                if is_internal_prompt(&candidate.task) {
                     continue;
                 }
                 if context.seen.contains(&candidate.key)
@@ -377,6 +480,215 @@ fn scan_file(
     cursor.offset = next_offset;
     state.files.insert(path_key, cursor);
     Ok(())
+}
+
+fn completion_from_event(
+    paths: &AppPaths,
+    event: &CompletionEvent,
+    now_seconds: u64,
+) -> CompletionCandidate {
+    let turn_state = load_turn_state(&paths.state, &event.turn_id).ok().flatten();
+    let task = turn_state
+        .as_ref()
+        .map(|state| state.prompt.trim())
+        .filter(|task| !task.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| event.task());
+    let thread_id = nonempty(
+        &event.thread_id,
+        turn_state
+            .as_ref()
+            .map(|state| state.thread_id.as_str())
+            .unwrap_or_default(),
+    );
+    let cwd = nonempty(
+        &event.cwd,
+        turn_state
+            .as_ref()
+            .map(|state| state.cwd.as_str())
+            .unwrap_or_default(),
+    );
+    let conversation_title = find_thread_title(&paths.session_index(), &thread_id)
+        .or_else(|| {
+            turn_state
+                .as_ref()
+                .and_then(|state| state.conversation_title_at_start.clone())
+        })
+        .unwrap_or_default();
+    let duration_seconds = turn_state.as_ref().and_then(|state| {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(now_seconds))
+            .and_then(|now| elapsed_since(state, now))
+            .map(|elapsed| elapsed.as_secs())
+    });
+    completion_candidate(
+        &event.turn_id,
+        &thread_id,
+        task,
+        nonempty(
+            &event.last_assistant_message,
+            "\u{4efb}\u{52a1}\u{5df2}\u{5b8c}\u{6210}\u{3002}",
+        ),
+        cwd,
+        conversation_title,
+        duration_seconds,
+        None,
+        now_seconds,
+    )
+}
+
+fn completion_from_transcript(
+    paths: &AppPaths,
+    cursor: &FileCursor,
+    completion: TaskCompletion,
+    now_seconds: u64,
+) -> CompletionCandidate {
+    let turn_state = load_turn_state(&paths.state, &completion.turn_id)
+        .ok()
+        .flatten();
+    let fallback_prompt = cursor
+        .prompts
+        .iter()
+        .rev()
+        .find(|prompt| !completion.turn_id.is_empty() && prompt.turn_id == completion.turn_id)
+        .or_else(|| cursor.prompts.last())
+        .map(|prompt| prompt.prompt.as_str())
+        .unwrap_or("\u{672a}\u{547d}\u{540d}\u{4efb}\u{52a1}");
+    let task = turn_state
+        .as_ref()
+        .map(|state| state.prompt.trim())
+        .filter(|task| !task.is_empty())
+        .unwrap_or(fallback_prompt)
+        .to_owned();
+    let thread_id = nonempty(
+        turn_state
+            .as_ref()
+            .map(|state| state.thread_id.as_str())
+            .unwrap_or_default(),
+        &cursor.session_id,
+    );
+    let cwd = nonempty(
+        turn_state
+            .as_ref()
+            .map(|state| state.cwd.as_str())
+            .unwrap_or_default(),
+        &cursor.cwd,
+    );
+    let conversation_title = find_thread_title(&paths.session_index(), &thread_id)
+        .or_else(|| {
+            turn_state
+                .as_ref()
+                .and_then(|state| state.conversation_title_at_start.clone())
+        })
+        .unwrap_or_default();
+    completion_candidate(
+        &completion.turn_id,
+        &thread_id,
+        task,
+        nonempty(
+            &completion.last_agent_message,
+            "\u{4efb}\u{52a1}\u{5df2}\u{5b8c}\u{6210}\u{3002}",
+        ),
+        cwd,
+        conversation_title,
+        completion.duration_seconds,
+        completion.completed_at_seconds,
+        now_seconds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn completion_candidate(
+    turn_id: &str,
+    thread_id: &str,
+    task: String,
+    details: String,
+    cwd: String,
+    conversation_title: String,
+    duration_seconds: Option<u64>,
+    completed_at_seconds: Option<u64>,
+    now_seconds: u64,
+) -> CompletionCandidate {
+    let key = digest_key(&[
+        "completion",
+        turn_id,
+        thread_id,
+        &completed_at_seconds.unwrap_or_default().to_string(),
+        &details,
+    ]);
+    CompletionCandidate {
+        key,
+        turn_id: turn_id.trim().to_owned(),
+        thread_id: thread_id.trim().to_owned(),
+        task,
+        details,
+        cwd,
+        conversation_title,
+        duration_seconds,
+        completed_at_seconds,
+        detected_at_seconds: now_seconds,
+        delivery_started_at_seconds: None,
+    }
+}
+
+fn add_completion_candidate(state: &mut MonitorState, candidate: CompletionCandidate) -> bool {
+    remember_completed_turn(state, &candidate.turn_id);
+    if !candidate.turn_id.is_empty()
+        && state
+            .delivered_turns
+            .iter()
+            .any(|turn_id| turn_id == &candidate.turn_id)
+    {
+        return false;
+    }
+    if let Some(existing) = state.pending_completions.iter_mut().find(|existing| {
+        existing.key == candidate.key
+            || (!candidate.turn_id.is_empty() && existing.turn_id == candidate.turn_id)
+    }) {
+        merge_completion_candidate(existing, candidate);
+        return false;
+    }
+    state.pending_completions.push(candidate);
+    true
+}
+
+fn merge_completion_candidate(existing: &mut CompletionCandidate, incoming: CompletionCandidate) {
+    replace_if_nonempty(&mut existing.thread_id, incoming.thread_id);
+    replace_if_nonempty(&mut existing.task, incoming.task);
+    replace_if_nonempty(&mut existing.details, incoming.details);
+    replace_if_nonempty(&mut existing.cwd, incoming.cwd);
+    replace_if_nonempty(
+        &mut existing.conversation_title,
+        incoming.conversation_title,
+    );
+    existing.duration_seconds = incoming.duration_seconds.or(existing.duration_seconds);
+    existing.completed_at_seconds = incoming
+        .completed_at_seconds
+        .or(existing.completed_at_seconds);
+    existing.detected_at_seconds = existing
+        .detected_at_seconds
+        .min(incoming.detected_at_seconds);
+}
+
+fn replace_if_nonempty(target: &mut String, incoming: String) {
+    if !incoming.trim().is_empty() {
+        *target = incoming;
+    }
+}
+
+fn remember_completed_turn(state: &mut MonitorState, turn_id: &str) {
+    let turn_id = turn_id.trim();
+    if turn_id.is_empty() {
+        return;
+    }
+    add_bounded(
+        &mut state.completed_turns,
+        turn_id.to_owned(),
+        MAX_COMPLETED_TURNS,
+    );
+    state
+        .confirming
+        .retain(|candidate| candidate.turn_id != turn_id);
 }
 
 fn candidate_from_error(
@@ -480,6 +792,96 @@ fn apply_stop_hook_goal_context(state: &mut MonitorState) {
             candidate.active_goal = true;
         }
     }
+}
+
+fn prepare_completion_deliveries(
+    paths: &AppPaths,
+    state: &mut MonitorState,
+    now_seconds: u64,
+) -> Result<Vec<PendingDelivery>> {
+    let delivered = state
+        .delivered_turns
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut retained = Vec::with_capacity(state.pending_completions.len());
+    let mut deliveries = Vec::new();
+
+    for mut candidate in std::mem::take(&mut state.pending_completions) {
+        if !candidate.turn_id.is_empty() && delivered.contains(&candidate.turn_id) {
+            continue;
+        }
+        if candidate
+            .delivery_started_at_seconds
+            .is_some_and(|started| now_seconds.saturating_sub(started) < DELIVERY_LEASE.as_secs())
+        {
+            retained.push(candidate);
+            continue;
+        }
+
+        if let Some(title) = resolved_completion_title(paths, &candidate) {
+            candidate.conversation_title = title;
+        } else if now_seconds.saturating_sub(candidate.detected_at_seconds)
+            < COMPLETION_TITLE_WAIT.as_secs()
+        {
+            retained.push(candidate);
+            continue;
+        }
+
+        let event = CompletionEvent {
+            event_type: "agent-turn-complete".to_owned(),
+            thread_id: candidate.thread_id.clone(),
+            turn_id: candidate.turn_id.clone(),
+            cwd: candidate.cwd.clone(),
+            input_messages: if candidate.task.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![candidate.task.clone()]
+            },
+            last_assistant_message: candidate.details.clone(),
+        };
+        let mut notification = completion_notification(paths, &event)?;
+        if !candidate.conversation_title.trim().is_empty() {
+            notification.conversation_title = candidate.conversation_title.clone();
+        }
+        if let Some(seconds) = candidate.duration_seconds {
+            notification.elapsed = Some(Duration::from_secs(seconds));
+        }
+        notification.event_id = candidate.key.clone();
+
+        candidate.delivery_started_at_seconds = Some(now_seconds);
+        deliveries.push(PendingDelivery {
+            key: candidate.key.clone(),
+            notification,
+        });
+        retained.push(candidate);
+    }
+
+    state.pending_completions = retained;
+    Ok(deliveries)
+}
+
+fn resolved_completion_title(paths: &AppPaths, candidate: &CompletionCandidate) -> Option<String> {
+    let turn_state = load_turn_state(&paths.state, &candidate.turn_id)
+        .ok()
+        .flatten();
+    let thread_id = nonempty(
+        &candidate.thread_id,
+        turn_state
+            .as_ref()
+            .map(|state| state.thread_id.as_str())
+            .unwrap_or_default(),
+    );
+    find_thread_title(&paths.session_index(), &thread_id)
+        .or_else(|| {
+            turn_state
+                .and_then(|state| state.conversation_title_at_start)
+                .filter(|title| !title.trim().is_empty())
+        })
+        .or_else(|| {
+            (!candidate.conversation_title.trim().is_empty())
+                .then(|| candidate.conversation_title.clone())
+        })
 }
 
 fn confirm_candidates(
@@ -655,6 +1057,19 @@ fn should_consider_error(error: &TerminalError, initial_index: bool, now_seconds
     })
 }
 
+fn should_consider_completion(
+    completion: &TaskCompletion,
+    initial_index: bool,
+    now_seconds: u64,
+) -> bool {
+    if !initial_index {
+        return true;
+    }
+    completion.completed_at_seconds.is_some_and(|completed| {
+        now_seconds.saturating_sub(completed) <= INITIAL_LOOKBACK.as_secs()
+    })
+}
+
 fn recent_session_files(paths: &AppPaths, now_seconds: u64) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for day in session_day_directories(&paths.codex_home, now_seconds) {
@@ -782,6 +1197,16 @@ fn prune_state(state: &mut MonitorState) {
             .completed_turns
             .drain(..state.completed_turns.len() - MAX_COMPLETED_TURNS);
     }
+    if state.delivered_turns.len() > MAX_DELIVERED_TURNS {
+        state
+            .delivered_turns
+            .drain(..state.delivered_turns.len() - MAX_DELIVERED_TURNS);
+    }
+    if state.pending_completions.len() > MAX_PENDING_COMPLETIONS {
+        state
+            .pending_completions
+            .drain(..state.pending_completions.len() - MAX_PENDING_COMPLETIONS);
+    }
     if state.confirming.len() > MAX_CONFIRMING {
         state
             .confirming
@@ -808,37 +1233,65 @@ fn with_state<T>(
 
     let result = (|| {
         let state_path = monitor_state_path(paths);
-        let first_run = !state_path.exists();
-        let mut state = load_state(&state_path)?;
-        let result = operation(&mut state, first_run)?;
+        let original_contents = match fs::read(&state_path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("无法读取 {}", state_path.display()));
+            }
+        };
+        let first_run = original_contents.is_none();
+        let mut state = original_contents
+            .as_deref()
+            .map(|contents| {
+                serde_json::from_slice(contents)
+                    .with_context(|| format!("无法解析状态文件 {}", state_path.display()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let migrated = migrate_state(&mut state);
+        let initial_scan = first_run || migrated || state.needs_initial_scan;
+        let result = operation(&mut state, initial_scan)?;
         let contents = serde_json::to_vec(&state).context("无法生成后台监听状态数据")?;
-        atomic_write(&state_path, &contents)?;
+        if original_contents.as_deref() != Some(contents.as_slice()) {
+            atomic_write(&state_path, &contents)?;
+        }
         Ok(result)
     })();
     let _ = FileExt::unlock(&lock);
     result
 }
 
-fn load_state(path: &Path) -> Result<MonitorState> {
-    let contents = match fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MonitorState::default());
+fn migrate_state(state: &mut MonitorState) -> bool {
+    if state.version >= MONITOR_STATE_VERSION {
+        return false;
+    }
+
+    // In older releases every `completed_turns` entry came from the direct
+    // notify path, which attempted delivery synchronously. Treat those turns
+    // as already delivered so the one-time transcript rescan cannot duplicate
+    // cards. Reset cursors to recover recent completions from pre-existing
+    // ChatGPT sessions that never loaded the notify configuration.
+    if state.version == 0 {
+        for turn_id in state.completed_turns.clone() {
+            add_bounded(&mut state.delivered_turns, turn_id, MAX_DELIVERED_TURNS);
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("无法读取 {}", path.display()));
+        for cursor in state.files.values_mut() {
+            *cursor = FileCursor::default();
         }
-    };
-    serde_json::from_slice(&contents)
-        .with_context(|| format!("无法解析状态文件 {}", path.display()))
+        state.needs_initial_scan = true;
+    }
+    state.version = MONITOR_STATE_VERSION;
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        WATCH_INTERVAL, mark_turn_completed, prepare_notifications, record_stop_fallback,
-        session_day_directories, settle_delivery,
+        WATCH_INTERVAL, enqueue_completion, mark_turn_completed, monitor_state_path,
+        prepare_notifications, record_stop_fallback, session_day_directories, settle_delivery,
     };
+    use crate::codex::CompletionEvent;
     use crate::model::Outcome;
     use crate::paths::AppPaths;
     use crate::state::{TurnState, write_turn_state};
@@ -888,6 +1341,203 @@ mod tests {
              {goal}\
              {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-1\",\"completed_at\":{now_seconds},\"duration_ms\":65000,\"error\":{{\"message\":\"stream disconnected before completion\"}}}}}}\n"
         )
+    }
+
+    fn transcript_with_completion(
+        turn_id: &str,
+        prompt: &str,
+        result: &str,
+        now_seconds: u64,
+    ) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\",\"cwd\":\"/workspace\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"internal_chat_message_metadata_passthrough\":{{\"turn_id\":\"{turn_id}\"}},\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}]}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn_id}\",\"completed_at\":{now_seconds},\"duration_ms\":65000,\"last_agent_message\":\"{result}\"}}}}\n"
+        )
+    }
+
+    fn completion_event(turn_id: &str) -> CompletionEvent {
+        CompletionEvent {
+            event_type: "agent-turn-complete".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: turn_id.to_owned(),
+            cwd: "/workspace".to_owned(),
+            input_messages: vec!["Implement async delivery".to_owned()],
+            last_assistant_message: "Async delivery is ready".to_owned(),
+        }
+    }
+
+    #[test]
+    fn normal_completion_waits_in_the_background_for_the_generated_title() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(
+            &transcript,
+            transcript_with_completion("turn-complete", "Build queue", "Queue ready", seconds),
+        )
+        .expect("write transcript");
+
+        let (summary, first) = prepare_notifications(&paths, now).expect("initial scan");
+        assert_eq!(summary.new_completions, 1);
+        assert!(first.is_empty());
+
+        fs::write(
+            paths.session_index(),
+            "{\"id\":\"thread-1\",\"thread_name\":\"Async completion delivery\"}\n",
+        )
+        .expect("write generated title");
+        let (_, deliveries) = prepare_notifications(&paths, now + Duration::from_secs(1))
+            .expect("title follow-up scan");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].notification.outcome, Outcome::Completed);
+        assert_eq!(
+            deliveries[0].notification.conversation_title,
+            "Async completion delivery"
+        );
+        assert_eq!(deliveries[0].notification.task, "Build queue");
+        assert_eq!(deliveries[0].notification.details_markdown, "Queue ready");
+        assert_eq!(
+            deliveries[0].notification.elapsed,
+            Some(Duration::from_secs(65))
+        );
+
+        settle_delivery(&paths, &deliveries[0].key, true).expect("settle completion");
+        let (_, duplicate) =
+            prepare_notifications(&paths, now + Duration::from_secs(2)).expect("deduplicated scan");
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn direct_notify_enqueues_without_waiting_and_uses_a_five_second_fallback() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, _) = timestamp();
+        assert!(
+            enqueue_completion(&paths, &completion_event("turn-direct"), now)
+                .expect("enqueue completion")
+        );
+
+        let (_, immediate) = prepare_notifications(&paths, now).expect("immediate scan");
+        assert!(immediate.is_empty());
+        let (_, waiting) =
+            prepare_notifications(&paths, now + Duration::from_secs(4)).expect("four-second scan");
+        assert!(waiting.is_empty());
+        let (_, fallback) =
+            prepare_notifications(&paths, now + Duration::from_secs(5)).expect("five-second scan");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(
+            fallback[0].notification.conversation_title,
+            "Codex \u{4f1a}\u{8bdd}"
+        );
+    }
+
+    #[test]
+    fn transcript_and_direct_notify_paths_deduplicate_the_same_turn() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(
+            transcript,
+            transcript_with_completion(
+                "turn-shared",
+                "Implement async delivery",
+                "Async delivery is ready",
+                seconds,
+            ),
+        )
+        .expect("write transcript");
+        fs::write(
+            paths.session_index(),
+            "{\"id\":\"thread-1\",\"thread_name\":\"Shared turn\"}\n",
+        )
+        .expect("write title");
+        assert!(
+            enqueue_completion(&paths, &completion_event("turn-shared"), now)
+                .expect("enqueue direct event")
+        );
+
+        let (_, deliveries) = prepare_notifications(&paths, now).expect("combined scan");
+        assert_eq!(deliveries.len(), 1);
+        settle_delivery(&paths, &deliveries[0].key, true).expect("settle delivery");
+        assert!(
+            !enqueue_completion(&paths, &completion_event("turn-shared"), now)
+                .expect("ignore delivered event")
+        );
+    }
+
+    #[test]
+    fn state_upgrade_recovers_recent_completions_from_preexisting_sessions() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        let sent = transcript_with_completion("turn-sent", "Sent task", "Sent result", seconds);
+        let missed =
+            transcript_with_completion("turn-missed", "Missed task", "Missed result", seconds);
+        fs::write(&transcript, format!("{sent}{missed}")).expect("write transcript");
+        fs::create_dir_all(&paths.state).expect("create state directory");
+        fs::write(
+            monitor_state_path(&paths),
+            serde_json::to_vec(&serde_json::json!({
+                "files": {
+                    (transcript.to_string_lossy().into_owned()): {
+                        "offset": sent.len() + missed.len()
+                    }
+                },
+                "seen": [],
+                "completed_turns": ["turn-sent"],
+                "confirming": []
+            }))
+            .expect("serialize legacy state"),
+        )
+        .expect("write legacy state");
+        fs::write(
+            paths.session_index(),
+            "{\"id\":\"thread-1\",\"thread_name\":\"Recovered old session\"}\n",
+        )
+        .expect("write title");
+
+        let (_, deliveries) = prepare_notifications(&paths, now).expect("migrated scan");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].notification.task, "Missed task");
+        assert_eq!(deliveries[0].notification.details_markdown, "Missed result");
+    }
+
+    #[test]
+    fn watcher_captures_a_later_completion_from_a_session_opened_before_update() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        let completed = transcript_with_completion(
+            "turn-old-session",
+            "Keep existing ChatGPT session",
+            "Old session completed",
+            seconds,
+        );
+        let task_complete_start = completed
+            .rfind("{\"type\":\"event_msg\"")
+            .expect("task complete record");
+        fs::write(&transcript, &completed[..task_complete_start]).expect("write active session");
+        fs::write(
+            paths.session_index(),
+            "{\"id\":\"thread-1\",\"thread_name\":\"Pre-update session\"}\n",
+        )
+        .expect("write title");
+
+        let (_, before_completion) = prepare_notifications(&paths, now).expect("initial scan");
+        assert!(before_completion.is_empty());
+
+        fs::write(&transcript, completed).expect("append completion");
+        let (_, deliveries) = prepare_notifications(&paths, now + Duration::from_secs(1))
+            .expect("incremental completion scan");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].notification.task,
+            "Keep existing ChatGPT session"
+        );
+        assert_eq!(
+            deliveries[0].notification.details_markdown,
+            "Old session completed"
+        );
     }
 
     #[test]

@@ -4,11 +4,13 @@ use codex_notify::codex::{
 };
 #[cfg(unix)]
 use codex_notify::codex::{RestoreNotifyResult, restore_notify_command};
+use codex_notify::monitor;
 use codex_notify::paths::AppPaths;
 use codex_notify::settings::{AppConfig, FeishuConfig, InstallationConfig, ReceiverIdType};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::{TempDir, tempdir};
 
 fn fixture() -> (TempDir, TempDir, AppPaths, PathBuf) {
@@ -79,6 +81,47 @@ fn mac_computer_use(previous: Option<Vec<String>>) -> Vec<String> {
         command.push(serde_json::to_string(&previous).expect("serialize previous"));
     }
     command
+}
+
+#[test]
+fn managed_notify_returns_quickly_and_persists_background_delivery() {
+    let (_app_home, _codex_home, paths, binary) = fixture();
+    fs::write(
+        paths.session_index(),
+        "{\"id\":\"thread-e2e\",\"thread_name\":\"Queued completion\"}\n",
+    )
+    .expect("write session title");
+    let event = serde_json::json!({
+        "type": "agent-turn-complete",
+        "thread-id": "thread-e2e",
+        "turn-id": "turn-e2e",
+        "cwd": "/workspace",
+        "input-messages": ["Verify queued delivery"],
+        "last-assistant-message": "Queue verified"
+    })
+    .to_string();
+
+    let started = Instant::now();
+    let output = run(&binary, &paths, &["notify", "--managed", &event]);
+    assert_success(&output);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "notify callback blocked for {:?}",
+        started.elapsed()
+    );
+
+    let (_, deliveries) =
+        monitor::prepare_notifications(&paths, SystemTime::now()).expect("prepare delivery");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0].notification.conversation_title,
+        "Queued completion"
+    );
+    assert_eq!(deliveries[0].notification.task, "Verify queued delivery");
+    assert_eq!(
+        deliveries[0].notification.details_markdown,
+        "Queue verified"
+    );
 }
 
 #[test]

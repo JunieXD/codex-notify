@@ -7,11 +7,13 @@ actionable notifications for Codex work. It starts with Feishu private-message
 notifications and is deliberately designed to support additional destinations
 later.
 
-The tool is installed once per user. It then participates in two local flows:
+The tool is installed once per user. It then participates in two local input
+flows and one durable delivery flow:
 
 ```text
-Codex completion notification -> codex-notify notify <event-json>
-Codex transcript/error watcher -> codex-notify watch
+Codex completion notification -> codex-notify notify <event-json> -> local queue
+Codex transcript completion/error records -> codex-notify watch -> local queue
+local queue -> title resolution and deduplication -> provider
 ```
 
 No application server, relay, analytics service, or shared database is part of
@@ -20,9 +22,9 @@ the product.
 ### Current M2 implementation
 
 M1 completion cards are implemented end to end: Feishu authentication, secure
-secret storage, Card JSON 2.0 rendering, prompt state capture,
-conversation-title lookup, duration formatting, existing-notifier chaining,
-backup, and reversible uninstall.
+secret storage, Card JSON 2.0 rendering, prompt state capture, durable
+background delivery, conversation-title lookup, duration formatting,
+existing-notifier chaining, backup, and reversible uninstall.
 
 M2 terminal-error monitoring is also implemented. It uses incremental JSONL
 offsets, a durable two-stage confirmation state, transcript and Stop Hook
@@ -146,10 +148,17 @@ Codex -> Computer Use (optional) -> codex-notify -> previous notifier (optional)
 
 The dispatcher:
 
-1. Invokes the previous command with the original event input.
-2. Sends the configured provider notification with the same event input.
-3. Captures failures independently so one destination does not suppress the
-   other.
+1. Persists the original completion event to the local delivery queue and
+   returns without waiting for a title or provider network request.
+2. Invokes the previous command with the original event input.
+3. Captures failures independently so the previous destination cannot discard
+   the queued provider notification.
+
+The watcher is the only provider sender. It merges documented notify events
+with best-effort completion records from local transcripts, resolves titles,
+leases deliveries, retries transient failures, and deduplicates by turn ID.
+This fallback allows a watcher upgrade to cover later completions from a
+ChatGPT session that started before the notify configuration was installed.
 
 Computer Use compatibility is guarded because `--previous-notify` is not a
 documented Codex configuration interface. The parser must recognize only
@@ -268,10 +277,11 @@ conversation_title_at_start
 started_at
 ```
 
-The completion dispatcher reads this record to calculate elapsed time and
-obtain the original prompt. A normal completion removes the record only after
-the notification dispatch has used it. This ordering is required because Stop
-and notify do not have a guaranteed execution order.
+The completion dispatcher and watcher read this record to calculate elapsed
+time and obtain the original prompt. A normal completion removes the record
+only after the provider acknowledges delivery. This ordering is required
+because Stop, notify, transcript discovery, and provider delivery do not have a
+guaranteed execution order.
 
 State records are written atomically and have a bounded retention policy. The
 implementation must prune abandoned records without touching user session
@@ -284,8 +294,10 @@ lookup must scan from the most recent index entry and must have a safe fallback
 when the index is absent or its format changes.
 
 For a normal completion, if neither the current index nor the title captured at
-turn start provides a title, the dispatcher retries the exact thread lookup for
-up to five seconds. An already available title must not incur this delay.
+turn start provides a title, the dispatcher first queues the event and exits.
+The watcher retries the exact thread lookup for up to five seconds without
+blocking Codex title generation. An already available title must not incur this
+delay.
 
 This lookup is an enhancement rather than a hard dependency. The tool must not
 fail a notification solely because a title cannot be found.
@@ -294,12 +306,16 @@ fail a notification solely because a title cannot be found.
 
 ### 8.1 Sources
 
-Normal completion comes from the documented `notify` event. Terminal-error
-coverage needs a local watcher because `notify` currently emits only completion
-events.
+Normal completion primarily comes from the documented `notify` event.
+The watcher also recognizes normal `task_complete` records as a best-effort
+fallback for sessions that did not load the current notify configuration.
+Terminal-error coverage needs the same local watcher because `notify` currently
+emits only completion events.
 
-The watcher reads only recently changed Codex session transcript files and
-tracks byte offsets. It watches terminal `task_complete` records with an error
+The watcher reads only recent Codex session transcript files and tracks byte
+offsets. On a state-schema upgrade it performs a bounded ten-minute lookback,
+seeding previous documented completions as delivered so the migration does not
+duplicate cards. It watches terminal `task_complete` records with an error
 message, including examples such as:
 
 - Stream disconnects and transport failures.
@@ -340,9 +356,11 @@ limitation in `doctor` and documentation.
 ### 8.4 Deduplication
 
 Each terminal event has a stable digest built from its turn ID, completion
-timestamp, and normalized error message. The watcher persists a bounded set of
-recent digests. State shared with the Stop fallback prevents a Stop alert and a
-watcher alert from notifying the same turn twice.
+timestamp, and normalized error message. Normal completions use the turn ID to
+merge the notify and transcript paths before delivery. The watcher persists
+bounded delivered-turn and terminal-event histories. State shared with the Stop
+fallback prevents completion, Stop, and transcript paths from notifying the
+same turn twice.
 
 The default retention target is 4,096 recent event digests and 24 hours for
 turn-state records. Both are configurable within documented safe bounds.

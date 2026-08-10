@@ -29,6 +29,7 @@ pub enum TranscriptEventKind {
     SessionMeta(SessionMeta),
     UserPrompt(UserPrompt),
     TaskStarted,
+    TaskCompleted(TaskCompletion),
     GoalStatus(String),
     TerminalError(TerminalError),
 }
@@ -43,6 +44,14 @@ pub struct SessionMeta {
 pub struct UserPrompt {
     pub turn_id: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCompletion {
+    pub turn_id: String,
+    pub last_agent_message: String,
+    pub completed_at_seconds: Option<u64>,
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,11 +259,23 @@ fn event_message(payload: &serde_json::Map<String, Value>) -> Vec<TranscriptEven
             .map(TranscriptEventKind::GoalStatus)
             .into_iter()
             .collect(),
-        Some("task_complete") => terminal_error(payload)
-            .map(TranscriptEventKind::TerminalError)
-            .into_iter()
-            .collect(),
+        Some("task_complete") => match terminal_error(payload) {
+            Some(error) => vec![TranscriptEventKind::TerminalError(error)],
+            None => vec![TranscriptEventKind::TaskCompleted(task_completion(payload))],
+        },
         _ => Vec::new(),
+    }
+}
+
+fn task_completion(payload: &serde_json::Map<String, Value>) -> TaskCompletion {
+    TaskCompletion {
+        turn_id: string_field(payload, "turn_id").unwrap_or_default(),
+        last_agent_message: string_field(payload, "last_agent_message").unwrap_or_default(),
+        completed_at_seconds: number_seconds(payload.get("completed_at")),
+        duration_seconds: payload
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .map(|milliseconds| milliseconds / 1_000),
     }
 }
 
@@ -368,6 +389,27 @@ mod tests {
             &event.kind,
             TranscriptEventKind::TerminalError(error)
                 if error.message.contains("\u{4f7f}\u{7528}\u{4e0a}\u{9650}")
+        )));
+    }
+
+    #[test]
+    fn reads_normal_task_completions_for_background_delivery() {
+        let directory = tempdir().expect("temporary directory");
+        let transcript = directory.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-2\",\"last_agent_message\":\"Done\",\"completed_at\":101,\"duration_ms\":5200}}\n",
+        )
+        .expect("write transcript");
+
+        let result = read_events_from(&transcript, 0).expect("read transcript");
+        assert!(result.events.iter().any(|event| matches!(
+            &event.kind,
+            TranscriptEventKind::TaskCompleted(completion)
+                if completion.turn_id == "turn-2"
+                    && completion.last_agent_message == "Done"
+                    && completion.completed_at_seconds == Some(101)
+                    && completion.duration_seconds == Some(5)
         )));
     }
 

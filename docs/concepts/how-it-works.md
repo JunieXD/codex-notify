@@ -5,31 +5,34 @@ description: codex-notify 如何接收 Codex 完成事件、确认中断并发�
 
 # 工作原理
 
-`codex-notify` 完全运行在用户电脑上，由完成通知链、Codex Hook 和后台 watcher 三部分协作。
+`codex-notify` 完全运行在用户电脑上，由完成通知链、Codex Hook 和后台 watcher 三部分协作。正常完成事件先写入本地队列，再由 watcher 统一发送。
 
 ```mermaid
 flowchart LR
     A["Codex 任务"] -->|"正常完成"| B["notify 通知链"]
     B --> C["Computer Use（可选）"]
-    C --> D["codex-notify"]
+    C --> D["本地发送队列"]
     A -->|"任务上下文"| E["Codex Hooks"]
-    E --> D
-    A -->|"异常终止"| F["本地 watcher"]
-    F -->|"确认未恢复"| D
-    D --> G["飞书卡片"]
+    E --> F["本地 watcher"]
+    A -->|"本地任务记录"| F
+    D --> F
+    F -->|"等待标题并去重"| G["飞书卡片"]
 ```
 
 ## 正常完成流程
 
 1. Codex 完成一轮任务并触发用户级 `notify`；
 2. Computer Use 如已启用，会先处理自己的事件；
-3. `codex-notify` 读取完成事件和 Hook 保存的任务上下文；
+3. `codex-notify` 将完成事件持久化到本地队列并立即返回，不阻塞 Codex 生成会话标题；
 4. 原有 notifier 如存在，会继续收到同一事件；
-5. `codex-notify` 生成飞书卡片并直接调用飞书开放平台。
+5. watcher 读取 Hook 保存的任务上下文，等待标题生成，最长 5 秒；
+6. watcher 生成飞书卡片并直接调用飞书开放平台，发送失败会保留事件稍后重试。
+
+如果任务在安装或升级前已经打开，可能不会调用新配置的 `notify`。watcher 还会增量识别本地任务记录中的正常完成事件，补充这类旧任务；同一个 turn 无论从哪条路径到达，都只会进入一次发送流程。
 
 ## 中断确认流程
 
-1. watcher 增量读取最近变化的 Codex 会话记录；
+1. watcher 增量读取最近变化的 Codex 本地任务记录；
 2. `Stop` Hook 在缺少最终消息时提供一个候选事件；
 3. 发现网络、服务或用量限制等异常后，先保存为待确认状态；
 4. 等待后再次确认任务没有恢复，也没有正常完成事件；
@@ -39,9 +42,9 @@ watcher 会保存读取位置，不会每次扫描完整会话历史。
 
 ## 为什么需要三个入口
 
-- `notify` 是正常完成的直接信号；
+- `notify` 是正常完成的官方直接信号；
 - `UserPromptSubmit` Hook 补充任务内容和开始时间；
-- watcher 与 `Stop` Hook 负责没有正常完成事件的异常情况。
+- watcher 补获旧任务的完成记录，并与 `Stop` Hook 一起确认异常情况。
 
 只依赖其中一个入口，都无法同时获得完整任务信息、可靠完成通知和中断提醒。
 

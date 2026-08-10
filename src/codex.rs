@@ -16,7 +16,7 @@ use crate::paths::AppPaths;
 use crate::settings::{InstallationConfig, atomic_write, resolved_write_path};
 use crate::state::{
     TurnState, elapsed_since, find_thread_title, load_turn_state, prune_turn_states,
-    remove_turn_state, wait_for_thread_title, write_turn_state,
+    remove_turn_state, write_turn_state,
 };
 
 pub const PROMPT_HOOK_MARKER: &str = "codex-notify: record task context";
@@ -30,7 +30,6 @@ const INTERNAL_TURN_SIGNATURES: &[&[&str]] = &[&[
     "fill the structured description field with a compact, search-oriented summary",
     "this is a keyword retrieval index, not a broad prose summary",
 ]];
-const THREAD_TITLE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionEvent {
@@ -153,7 +152,6 @@ pub fn completion_notification(paths: &AppPaths, event: &CompletionEvent) -> Res
                 .and_then(|state| state.conversation_title_at_start.clone())
                 .filter(|title| !title.trim().is_empty())
         })
-        .or_else(|| wait_for_thread_title(&session_index, &thread_id, THREAD_TITLE_WAIT_TIMEOUT))
         .unwrap_or_else(|| "Codex \u{4f1a}\u{8bdd}".to_owned());
     let elapsed = state
         .as_ref()
@@ -915,8 +913,6 @@ mod tests {
     use crate::paths::AppPaths;
     use std::fs;
     use std::path::Path;
-    use std::thread;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     fn paths(app_home: &Path, codex_home: &Path) -> AppPaths {
@@ -1078,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_a_new_session_title() {
+    fn completion_returns_without_blocking_when_a_new_session_title_is_pending() {
         let app_home = tempdir().expect("temporary app home");
         let codex_home = tempdir().expect("temporary Codex home");
         let paths = paths(app_home.path(), codex_home.path());
@@ -1091,15 +1087,6 @@ mod tests {
         };
         assert!(record_prompt_context(&paths, &prompt).expect("record prompt"));
 
-        let index_path = paths.session_index();
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(40));
-            fs::write(
-                index_path,
-                "{\"id\":\"thread-new\",\"thread_name\":\"Generated title\"}\n",
-            )
-            .expect("write generated title");
-        });
         let completion = CompletionEvent {
             event_type: "agent-turn-complete".to_owned(),
             thread_id: "thread-new".to_owned(),
@@ -1110,8 +1097,7 @@ mod tests {
         };
 
         let notification = completion_notification(&paths, &completion).expect("notification");
-        writer.join().expect("join title writer");
-        assert_eq!(notification.conversation_title, "Generated title");
+        assert_eq!(notification.conversation_title, "Codex \u{4f1a}\u{8bdd}");
     }
 
     #[test]

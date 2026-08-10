@@ -13,10 +13,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::codex::{
     CompletionEvent, NotifyReconcileResult, PromptHookEvent, RestoreNotifyResult, StopHookEvent,
-    backup_file, completion_notification, has_prompt_hook, has_stop_hook, install_integration,
-    notify_integration_placement, reconcile_notify_integration, record_prompt_context,
-    remove_completion_state, remove_empty_created_codex_files, remove_prompt_hook,
-    remove_stop_hook, restore_notify_command, rollback_integration, run_previous_notifier,
+    backup_file, has_prompt_hook, has_stop_hook, install_integration, notify_integration_placement,
+    reconcile_notify_integration, record_prompt_context, remove_empty_created_codex_files,
+    remove_prompt_hook, remove_stop_hook, restore_notify_command, rollback_integration,
+    run_previous_notifier,
 };
 use crate::diagnostics;
 use crate::feishu::FeishuClient;
@@ -177,6 +177,7 @@ struct InstallPreparedArgs {
 }
 
 const CONFIG_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const WATCHER_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHER_LOCK_FILENAME: &str = "watcher-process.lock";
@@ -1120,40 +1121,26 @@ fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> 
                 .and_then(|config| config.installation.previous_notify.as_ref())
         })
     };
+    let event: Option<CompletionEvent> = match serde_json::from_str(&event_json) {
+        Ok(event) => Some(event),
+        Err(_) => {
+            diagnostics::record(&paths, "Codex notify 传入了无效的事件 JSON");
+            None
+        }
+    };
+    if config.is_some()
+        && let Some(event) = event.as_ref()
+        && monitor::enqueue_completion(&paths, event, SystemTime::now()).is_err()
+    {
+        diagnostics::record(&paths, "任务完成通知未能加入后台发送队列");
+    }
     if let Some(previous) = previous
         && run_previous_notifier(previous, &event_json).is_err()
     {
         diagnostics::record(&paths, "原有 Codex 通知命令执行失败");
     }
-
-    let Some(config) = config else {
+    if config.is_none() {
         diagnostics::record(&paths, "codex-notify 尚未配置，已跳过本次通知");
-        return Ok(());
-    };
-
-    let event: CompletionEvent = match serde_json::from_str(&event_json) {
-        Ok(event) => event,
-        Err(_) => {
-            diagnostics::record(&paths, "Codex notify 传入了无效的事件 JSON");
-            return Ok(());
-        }
-    };
-    if !event.is_completion() || event.is_internal() {
-        return Ok(());
-    }
-    if monitor::mark_turn_completed(&paths, &event.turn_id).is_err() {
-        diagnostics::record(&paths, "任务正常完成后未能取消待发送的异常通知");
-    }
-
-    let result: Result<()> = (|| {
-        let notification = completion_notification(&paths, &event)?;
-        let secret = KeyringSecretStore.get_feishu_secret(&config.feishu)?;
-        FeishuClient::new()?.send(&config.feishu, &secret, &notification)?;
-        Ok(())
-    })();
-    let _ = remove_completion_state(&paths, &event);
-    if result.is_err() {
-        diagnostics::record(&paths, "飞书任务完成通知发送失败");
     }
     Ok(())
 }
@@ -1212,27 +1199,32 @@ fn watch(arguments: WatchArgs) -> Result<()> {
     let _watcher_lease = (!arguments.once)
         .then(|| acquire_watcher_lease(&paths))
         .transpose()?;
+    let mut next_config_reconcile = Instant::now();
     let mut next_monitor_scan = Instant::now();
     loop {
-        if !arguments.once {
-            if watcher_stop_requested(&paths) {
-                return Ok(());
-            }
-            let Some(latest_config) = AppConfig::load(&paths)? else {
-                return Ok(());
-            };
-            config = latest_config;
+        let now = Instant::now();
+        if !arguments.once && watcher_stop_requested(&paths) {
+            return Ok(());
         }
-        if let Err(error) = reconcile_active_config(&paths, &mut config) {
-            if arguments.once {
-                return Err(error);
+        if arguments.once || now >= next_config_reconcile {
+            if !arguments.once {
+                let Some(latest_config) = AppConfig::load(&paths)? else {
+                    return Ok(());
+                };
+                config = latest_config;
             }
-            diagnostics::record(&paths, &format!("通知接入自动同步失败：{error:#}"));
+            if let Err(error) = reconcile_active_config(&paths, &mut config) {
+                if arguments.once {
+                    return Err(error);
+                }
+                diagnostics::record(&paths, &format!("通知接入自动同步失败：{error:#}"));
+            }
+            next_config_reconcile = Instant::now() + CONFIG_RECONCILE_INTERVAL;
         }
-        if arguments.once || Instant::now() >= next_monitor_scan {
+        if arguments.once || now >= next_monitor_scan {
             match watch_once(&paths, &config) {
                 Ok(delivered) if arguments.once => {
-                    println!("检查完成，本次发送了 {delivered} 条任务异常通知。");
+                    println!("检查完成，本次发送了 {delivered} 条任务通知。");
                     return Ok(());
                 }
                 Ok(_) => {}
@@ -1241,7 +1233,7 @@ fn watch(arguments: WatchArgs) -> Result<()> {
             }
             next_monitor_scan = Instant::now() + monitor::WATCH_INTERVAL;
         }
-        thread::sleep(CONFIG_RECONCILE_INTERVAL);
+        thread::sleep(WATCHER_TICK_INTERVAL);
     }
 }
 
@@ -1325,7 +1317,7 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
             }
             Err(error) => {
                 let _ = monitor::settle_delivery(paths, &delivery.key, false);
-                diagnostics::record(paths, &format!("飞书任务异常通知发送失败：{error:#}"));
+                diagnostics::record(paths, &format!("飞书任务通知发送失败：{error:#}"));
             }
         }
     }
