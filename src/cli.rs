@@ -148,6 +148,12 @@ struct UpdateArgs {
     /// 跳过确认提示。
     #[arg(short, long)]
     yes: bool,
+    /// 使用指定的 HTTP 或 HTTPS 代理检查并下载更新。
+    #[arg(long, value_name = "URL", conflicts_with = "no_proxy")]
+    proxy: Option<String>,
+    /// 忽略环境变量和 Windows 系统代理，直接连接更新服务器。
+    #[arg(long, conflicts_with = "proxy")]
+    no_proxy: bool,
     /// 为端到端测试指定发行版下载目录。
     #[arg(long, hide = true)]
     download_base: Option<String>,
@@ -617,6 +623,7 @@ fn sync() -> Result<()> {
 }
 
 fn update(arguments: UpdateArgs) -> Result<()> {
+    let network = updater::NetworkOptions::new(arguments.proxy.clone(), arguments.no_proxy);
     let current = updater::current_version()?;
     println!("当前版本：v{current}");
     println!("正在检查更新……");
@@ -624,6 +631,7 @@ fn update(arguments: UpdateArgs) -> Result<()> {
         &arguments.repository,
         arguments.version.as_deref(),
         arguments.download_base.as_deref(),
+        &network,
     )?;
     let needed = updater::update_needed(&current, &release.version, arguments.force)?;
 
@@ -656,7 +664,7 @@ fn update(arguments: UpdateArgs) -> Result<()> {
         .parent()
         .context("无法确定当前程序所在目录")?;
     println!("正在下载并校验 {}……", release.tag);
-    let prepared = updater::prepare_release(release, staging_parent)?;
+    let prepared = updater::prepare_release(release, staging_parent, &network)?;
     let target_tag = prepared.info.tag.clone();
     apply_self_update(
         &paths,
@@ -2011,6 +2019,25 @@ mod cli_tests {
             ErrorKind::DisplayHelp,
             "{update_help:?}"
         );
+
+        let proxy_conflict = localized_cli_command()
+            .try_get_matches_from([
+                "codex-notify",
+                "update",
+                "--proxy",
+                "http://127.0.0.1:7890",
+                "--no-proxy",
+            ])
+            .expect_err("代理与强制直连不能同时使用");
+        assert_eq!(proxy_conflict.kind(), ErrorKind::ArgumentConflict);
+
+        let update_help = localized_cli_command()
+            .find_subcommand_mut("update")
+            .expect("update 子命令")
+            .render_long_help()
+            .to_string();
+        assert!(update_help.contains("--proxy <URL>"));
+        assert!(update_help.contains("--no-proxy"));
     }
 
     #[test]

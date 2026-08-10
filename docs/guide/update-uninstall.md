@@ -34,6 +34,24 @@ codex-notify update
 codex-notify update --check
 ```
 
+## 通过代理升级
+
+Windows 会自动使用“设置 → 网络和 Internet → 代理”中已启用的手动系统代理。也可以在任意平台为本次升级明确指定 HTTP 或 HTTPS 代理：
+
+```sh
+codex-notify update --proxy http://127.0.0.1:7890
+```
+
+程序也支持标准的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY` 环境变量。需要排查代理影响时，可以强制直连：
+
+```sh
+codex-notify update --no-proxy
+```
+
+代理优先级依次为 `--proxy`、代理环境变量、Windows 系统代理、直连。连接超时时，程序会根据当前连接方式提示检查代理软件或网络设置。
+
+从旧版本首次升级到支持系统代理的版本时，如果 `codex-notify update` 仍然超时，可以重新运行上方的 Windows 安装命令。安装脚本会读取已启用的系统代理并把升级交给现有程序；完成这次升级后，后续运行 `codex-notify update` 会直接自动发现系统代理。
+
 ## 重新运行安装脚本
 
 已有安装时，安装脚本会自动调用同一套安全升级流程。

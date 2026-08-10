@@ -1,21 +1,65 @@
 //! Download, verify, and stage codex-notify release binaries.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
+use reqwest::{NoProxy, Proxy, Url};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tempfile::{TempDir, TempPath};
+#[cfg(windows)]
+use winreg::RegKey;
+#[cfg(windows)]
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 
 pub const DEFAULT_REPOSITORY: &str = "JunieXD/codex-notify";
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
+#[cfg(windows)]
+const WINDOWS_INTERNET_SETTINGS_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkOptions {
+    proxy: Option<String>,
+    no_proxy: bool,
+}
+
+impl NetworkOptions {
+    pub fn new(proxy: Option<String>, no_proxy: bool) -> Self {
+        Self { proxy, no_proxy }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkRoute {
+    ExplicitProxy,
+    EnvironmentProxy,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WindowsSystemProxy,
+    ProxyDisabled,
+    Direct,
+}
+
+#[derive(Debug)]
+struct NetworkClient {
+    client: Client,
+    route: NetworkRoute,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemProxySettings {
+    address: String,
+    bypass: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
@@ -82,9 +126,10 @@ pub fn resolve_release(
     repository: &str,
     requested_version: Option<&str>,
     download_base_override: Option<&str>,
+    network: &NetworkOptions,
 ) -> Result<ReleaseInfo> {
     validate_repository(repository)?;
-    let client = http_client()?;
+    let client = http_client(network)?;
     let tag = match requested_version {
         Some(version) => normalized_tag(version)?.0,
         None => latest_release_tag(&client, repository)?,
@@ -110,8 +155,12 @@ pub fn update_needed(current: &Version, target: &Version, force: bool) -> Result
     Ok(force || target != current)
 }
 
-pub fn prepare_release(info: ReleaseInfo, staging_parent: &Path) -> Result<PreparedRelease> {
-    let client = http_client()?;
+pub fn prepare_release(
+    info: ReleaseInfo,
+    staging_parent: &Path,
+    network: &NetworkOptions,
+) -> Result<PreparedRelease> {
+    let client = http_client(network)?;
     let archive_url = format!("{}/{}", info.download_base, info.asset_name);
     let checksum_url = format!("{}/SHA256SUMS", info.download_base);
     let archive = download_limited(&client, &archive_url, MAX_ARCHIVE_BYTES)
@@ -258,11 +307,10 @@ fn normalized_tag(value: &str) -> Result<(String, Version)> {
     Ok((format!("v{version}"), version))
 }
 
-fn latest_release_tag(client: &Client, repository: &str) -> Result<String> {
+fn latest_release_tag(client: &NetworkClient, repository: &str) -> Result<String> {
     let url = format!("https://api.github.com/repos/{repository}/releases/latest");
     let release = client
         .get(&url)
-        .send()
         .context("无法查询最新 GitHub Release")?
         .error_for_status()
         .context("GitHub 没有返回最新发行版")?
@@ -271,20 +319,187 @@ fn latest_release_tag(client: &Client, repository: &str) -> Result<String> {
     Ok(release.tag_name)
 }
 
-fn http_client() -> Result<Client> {
-    Client::builder()
+fn http_client(network: &NetworkOptions) -> Result<NetworkClient> {
+    if network.proxy.is_some() && network.no_proxy {
+        bail!("--proxy 与 --no-proxy 不能同时使用");
+    }
+
+    let mut builder = Client::builder()
         .user_agent(format!("codex-notify/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("无法创建升级网络客户端")
+        .timeout(Duration::from_secs(120));
+    let route;
+
+    if network.no_proxy {
+        builder = builder.no_proxy();
+        route = NetworkRoute::ProxyDisabled;
+    } else if let Some(address) = network.proxy.as_deref() {
+        builder = builder.proxy(proxy_from_address(address, None)?);
+        route = NetworkRoute::ExplicitProxy;
+    } else if proxy_environment_configured() {
+        route = NetworkRoute::EnvironmentProxy;
+    } else {
+        #[cfg(windows)]
+        {
+            if let Some(settings) = windows_system_proxy() {
+                builder = builder.proxy(proxy_from_address(
+                    &settings.address,
+                    settings.bypass.as_deref(),
+                )?);
+                route = NetworkRoute::WindowsSystemProxy;
+            } else {
+                route = NetworkRoute::Direct;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            route = NetworkRoute::Direct;
+        }
+    }
+
+    let client = builder.build().context("无法创建升级网络客户端")?;
+    Ok(NetworkClient { client, route })
 }
 
-fn download_limited(client: &Client, url: &str, maximum: u64) -> Result<Vec<u8>> {
+impl NetworkClient {
+    fn get(&self, url: &str) -> Result<Response> {
+        self.client
+            .get(url)
+            .send()
+            .map_err(|error| friendly_request_error(error, self.route))
+    }
+}
+
+fn proxy_environment_configured() -> bool {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn proxy_from_address(address: &str, bypass: Option<&str>) -> Result<Proxy> {
+    let address = normalized_proxy_address(address)
+        .context("代理地址不能为空；示例：--proxy http://127.0.0.1:7890")?;
+    let parsed =
+        Url::parse(&address).context("代理地址无效；示例：--proxy http://127.0.0.1:7890")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("升级代理仅支持 http:// 或 https:// 地址");
+    }
+    let mut proxy =
+        Proxy::all(parsed).context("代理地址无效；示例：--proxy http://127.0.0.1:7890")?;
+    if let Some(no_proxy) = combined_no_proxy(bypass) {
+        proxy = proxy.no_proxy(Some(no_proxy));
+    }
+    Ok(proxy)
+}
+
+fn normalized_proxy_address(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return None;
+    }
+    Some(if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("http://{address}")
+    })
+}
+
+fn normalized_windows_bypass(bypass: Option<&str>) -> Option<String> {
+    let entries = bypass?
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && !entry.eq_ignore_ascii_case("<local>"))
+        .map(|entry| entry.strip_prefix("*.").unwrap_or(entry))
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then(|| entries.join(","))
+}
+
+fn combined_no_proxy(windows_bypass: Option<&str>) -> Option<NoProxy> {
+    let environment = env::var("NO_PROXY")
+        .or_else(|_| env::var("no_proxy"))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let windows = normalized_windows_bypass(windows_bypass);
+    let combined = [environment, windows]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+    NoProxy::from_string(&combined)
+}
+
+#[cfg(any(windows, test))]
+fn windows_https_proxy(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !value.contains('=') {
+        return Some(value.to_owned());
+    }
+    value.split(';').find_map(|entry| {
+        let (scheme, address) = entry.split_once('=')?;
+        scheme
+            .trim()
+            .eq_ignore_ascii_case("https")
+            .then(|| address.trim().to_owned())
+            .filter(|address| !address.is_empty())
+    })
+}
+
+#[cfg(windows)]
+fn windows_system_proxy() -> Option<SystemProxySettings> {
+    let settings = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(WINDOWS_INTERNET_SETTINGS_KEY, KEY_READ)
+        .ok()?;
+    let enabled = settings.get_value::<u32, _>("ProxyEnable").ok()?;
+    if enabled == 0 {
+        return None;
+    }
+    let configured = settings.get_value::<String, _>("ProxyServer").ok()?;
+    let address = windows_https_proxy(&configured)?;
+    let bypass = settings
+        .get_value::<String, _>("ProxyOverride")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Some(SystemProxySettings { address, bypass })
+}
+
+fn friendly_request_error(error: reqwest::Error, route: NetworkRoute) -> anyhow::Error {
+    let message = request_failure_message(route, error.is_timeout());
+    anyhow!("{message}（{error}）")
+}
+
+fn request_failure_message(route: NetworkRoute, timed_out: bool) -> &'static str {
+    match (route, timed_out) {
+        (NetworkRoute::ExplicitProxy, true)
+        | (NetworkRoute::EnvironmentProxy, true)
+        | (NetworkRoute::WindowsSystemProxy, true) => {
+            "通过代理连接 GitHub 超时；请确认代理软件正在运行、代理地址和端口正确，然后重试"
+        }
+        (NetworkRoute::ExplicitProxy, false)
+        | (NetworkRoute::EnvironmentProxy, false)
+        | (NetworkRoute::WindowsSystemProxy, false) => {
+            "无法通过代理连接 GitHub；请确认代理软件正在运行、代理地址和端口正确，然后重试"
+        }
+        (NetworkRoute::ProxyDisabled, true) => {
+            "直连 GitHub 超时；当前已使用 --no-proxy 禁用代理，请检查网络后重试"
+        }
+        (NetworkRoute::ProxyDisabled, false) => {
+            "无法直连 GitHub；当前已使用 --no-proxy 禁用代理，请检查网络后重试"
+        }
+        (NetworkRoute::Direct, true) => {
+            "连接 GitHub 超时；如果正在使用代理软件，请开启系统代理或 TUN 模式，也可以使用 --proxy <URL> 重试"
+        }
+        (NetworkRoute::Direct, false) => {
+            "无法连接 GitHub；如果正在使用代理软件，请开启系统代理或 TUN 模式，也可以使用 --proxy <URL> 重试"
+        }
+    }
+}
+
+fn download_limited(client: &NetworkClient, url: &str, maximum: u64) -> Result<Vec<u8>> {
     let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("无法请求 {url}"))?
+        .get(url)?
         .error_for_status()
         .with_context(|| format!("下载失败：{url}"))?;
     read_limited(response, maximum)
@@ -473,7 +688,9 @@ fn release_executable_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_name_for, checksum_for_asset, install_executable, normalized_tag, update_needed,
+        NetworkRoute, asset_name_for, checksum_for_asset, install_executable,
+        normalized_proxy_address, normalized_tag, normalized_windows_bypass,
+        request_failure_message, update_needed, windows_https_proxy,
     };
     use semver::Version;
 
@@ -516,6 +733,52 @@ mod tests {
         assert!(update_needed(&current, &Version::new(2, 1, 0), false).expect("upgrade"));
         assert!(update_needed(&current, &Version::new(1, 9, 0), false).is_err());
         assert!(update_needed(&current, &Version::new(1, 9, 0), true).expect("forced"));
+    }
+
+    #[test]
+    fn windows_proxy_parser_selects_the_https_route() {
+        assert_eq!(
+            windows_https_proxy("10.211.55.2:7897").as_deref(),
+            Some("10.211.55.2:7897")
+        );
+        assert_eq!(
+            windows_https_proxy("http=127.0.0.1:8080;https=127.0.0.1:8443").as_deref(),
+            Some("127.0.0.1:8443")
+        );
+        assert_eq!(windows_https_proxy("http=127.0.0.1:8080"), None);
+        assert_eq!(windows_https_proxy("   "), None);
+    }
+
+    #[test]
+    fn proxy_addresses_and_windows_bypass_entries_are_normalized() {
+        assert_eq!(
+            normalized_proxy_address("127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            normalized_proxy_address("https://proxy.example:443").as_deref(),
+            Some("https://proxy.example:443")
+        );
+        assert_eq!(normalized_proxy_address("  "), None);
+        assert_eq!(
+            normalized_windows_bypass(Some("<local>;localhost;*.example.com")).as_deref(),
+            Some("localhost,example.com")
+        );
+    }
+
+    #[test]
+    fn network_failures_explain_the_relevant_recovery() {
+        let direct = request_failure_message(NetworkRoute::Direct, true);
+        assert!(direct.contains("连接 GitHub 超时"));
+        assert!(direct.contains("代理软件"));
+        assert!(direct.contains("--proxy <URL>"));
+
+        let proxied = request_failure_message(NetworkRoute::WindowsSystemProxy, true);
+        assert!(proxied.contains("通过代理连接 GitHub 超时"));
+        assert!(proxied.contains("代理地址和端口"));
+
+        let disabled = request_failure_message(NetworkRoute::ProxyDisabled, true);
+        assert!(disabled.contains("--no-proxy"));
     }
 
     #[test]

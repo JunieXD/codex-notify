@@ -600,6 +600,15 @@ the previous executable and watcher. Re-running an install script delegates to
 this command when available; a downloaded newer binary performs the same
 transaction when upgrading a legacy installation.
 
+Update networking accepts an explicit `--proxy` or `--no-proxy`, otherwise it
+uses standard proxy environment variables before the enabled per-user Windows
+manual system proxy. Connection failures must identify whether a proxy or
+direct route was attempted and give an actionable recovery without naming a
+specific proxy product.
+The Windows installer must pass an enabled manual system proxy to older
+installed updaters so users can bootstrap into this behavior without editing
+terminal environment variables.
+
 winget and crates.io publication are later milestones, after the installer,
 upgrade, signing, and compatibility behavior are stable.
 

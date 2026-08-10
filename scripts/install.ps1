@@ -24,6 +24,40 @@ function Remove-InstallTempDirectory {
     Write-Warning "无法删除安装临时目录：$Path"
 }
 
+function Get-EnabledSystemHttpsProxy {
+    try {
+        $settings = Get-ItemProperty `
+            -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" `
+            -ErrorAction Stop
+        if ([int]$settings.ProxyEnable -ne 1) {
+            return $null
+        }
+
+        $server = ([string]$settings.ProxyServer).Trim()
+        if (-not $server) {
+            return $null
+        }
+        if ($server.Contains("=")) {
+            $httpsEntry = @(
+                $server.Split(";") | Where-Object { $_ -match '^\s*https\s*=' }
+            ) | Select-Object -First 1
+            if (-not $httpsEntry) {
+                return $null
+            }
+            $server = ($httpsEntry -split "=", 2)[1].Trim()
+        }
+        if (-not $server) {
+            return $null
+        }
+        if ($server -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+            $server = "http://$server"
+        }
+        return $server
+    } catch {
+        return $null
+    }
+}
+
 $target = "x86_64-pc-windows-msvc"
 $asset = "codex-notify-$target.zip"
 $targetPath = Join-Path $InstallDir "codex-notify.exe"
@@ -52,9 +86,25 @@ if ($supportsUpdate) {
     if ($forceUpdate) {
         $updateArgs += "--force"
     }
-    & $targetPath @updateArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "codex-notify 未能完成升级，原有安装已保留。"
+
+    $injectedSystemProxy = $false
+    if (-not $env:HTTPS_PROXY -and -not $env:ALL_PROXY) {
+        $systemProxy = Get-EnabledSystemHttpsProxy
+        if ($systemProxy) {
+            $env:HTTPS_PROXY = $systemProxy
+            $injectedSystemProxy = $true
+            Write-Host "检测到 Windows 系统代理，正在通过该代理升级……"
+        }
+    }
+    try {
+        & $targetPath @updateArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "codex-notify 未能完成升级，原有安装已保留。"
+        }
+    } finally {
+        if ($injectedSystemProxy) {
+            Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+        }
     }
     return
 }

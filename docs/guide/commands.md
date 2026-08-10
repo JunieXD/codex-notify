@@ -84,6 +84,10 @@ codex-notify update
 | `--version vX.Y.Z` | 安装指定版本 |
 | `--force` | 允许重新安装当前版本或明确降级 |
 | `-y`、`--yes` | 跳过升级确认 |
+| `--proxy <URL>` | 使用指定的 HTTP 或 HTTPS 代理检查并下载更新 |
+| `--no-proxy` | 忽略环境变量和 Windows 系统代理，直接连接更新服务器 |
+
+Windows 会自动使用“设置 → 网络和 Internet → 代理”中已启用的手动系统代理。所有平台仍支持标准的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY` 环境变量；命令行 `--proxy` 的优先级最高。
 
 ## `watch`：运行中断监听
 
