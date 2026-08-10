@@ -103,7 +103,11 @@ explains where to obtain the value and what format to expect. App Secret input
 is hidden and followed by a safe acknowledgement that input was received. The
 receiver type uses a keyboard selection menu with contextual descriptions.
 Invalid input remains at the current prompt with a useful error instead of
-terminating the entire initialization flow.
+terminating the entire initialization flow. The final write confirmation
+defaults to yes because the preceding summary already explains every change and
+the automatic backups. After installation, ChatGPT App users are told to open
+Settings, enter Hooks, and trust the UserPromptSubmit and Stop Hooks in the user
+section; Codex CLI users are told to run `/hooks` and trust the same two Hooks.
 
 The Stop Hook never sends an interruption card immediately. It only creates a
 pending candidate, which the watcher confirms using the same rules as a

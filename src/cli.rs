@@ -180,6 +180,11 @@ const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHER_LOCK_FILENAME: &str = "watcher-process.lock";
 const WATCHER_STOP_FILENAME: &str = "watcher.stop";
 const UPDATE_LOCK_FILENAME: &str = ".codex-notify-update.lock";
+const HOOK_TRUST_GUIDANCE: &str = "还差一步：信任两个用户 Hook\n\
+如果你使用 ChatGPT App（原 Codex App）：\n\
+  1. 打开“设置”，进入“钩子”。\n\
+  2. 在“用户”区域找到 UserPromptSubmit 和 Stop，分别设为“信任”。\n\
+如果你使用 Codex CLI：运行 /hooks，然后信任这两个 Hook。";
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -277,7 +282,7 @@ fn init(arguments: InitArgs) -> Result<()> {
     if !arguments.yes
         && !Confirm::with_theme(&theme)
             .with_prompt("确认写入配置并启动后台监听吗？")
-            .default(false)
+            .default(true)
             .interact()
             .context("无法读取确认结果")?
     {
@@ -349,7 +354,7 @@ fn init(arguments: InitArgs) -> Result<()> {
     if let Some(path) = setup.hooks_backup {
         println!("Hook 配置备份：{}", path.display());
     }
-    println!("下一步：在 Codex 中运行 /hooks，信任新增的 UserPromptSubmit 和 Stop Hook。");
+    println!("\n{HOOK_TRUST_GUIDANCE}");
 
     let should_test = !arguments.skip_test
         && (arguments.yes
@@ -1608,9 +1613,10 @@ fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        acquire_update_lease, acquire_watcher_lease, receiver_type_from_index, receiver_type_index,
-        refresh_existing_installation, remove_directory_tree, request_watcher_stop,
-        validate_app_id, validate_receiver_id, wait_for_watcher_exit, watcher_stop_requested,
+        HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease, receiver_type_from_index,
+        receiver_type_index, refresh_existing_installation, remove_directory_tree,
+        request_watcher_stop, validate_app_id, validate_receiver_id, wait_for_watcher_exit,
+        watcher_stop_requested,
     };
     use crate::paths::AppPaths;
     use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
@@ -1674,6 +1680,15 @@ mod cli_tests {
         assert!(validate_receiver_id(ReceiverIdType::ChatId, "oc_example").is_ok());
         assert!(validate_receiver_id(ReceiverIdType::ChatId, "ou_example").is_err());
         assert!(validate_receiver_id(ReceiverIdType::UserId, "employee-001").is_ok());
+    }
+
+    #[test]
+    fn hook_trust_guidance_names_the_app_location_and_both_hooks() {
+        assert!(HOOK_TRUST_GUIDANCE.contains("ChatGPT App（原 Codex App）"));
+        assert!(HOOK_TRUST_GUIDANCE.contains("“设置”，进入“钩子”"));
+        assert!(HOOK_TRUST_GUIDANCE.contains("“用户”区域"));
+        assert!(HOOK_TRUST_GUIDANCE.contains("UserPromptSubmit"));
+        assert!(HOOK_TRUST_GUIDANCE.contains("Stop"));
     }
 
     #[test]

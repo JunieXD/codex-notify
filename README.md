@@ -72,7 +72,10 @@ codex-notify init
 
 中文向导会说明每项信息的获取位置。App Secret 输入时不会显示内容，接收方式可用方向键选择；填错时可以直接重新输入，无需重新运行命令。确认前不会修改任何文件，确认后会先备份现有配置。
 
-初始化完成后，在 Codex 中运行 `/hooks`，信任新增的 `UserPromptSubmit` 和 `Stop` Hook。
+初始化完成后还需要信任新增的 `UserPromptSubmit` 和 `Stop` Hook：
+
+- ChatGPT App（原 Codex App）：打开“设置”，进入“钩子”，在“用户”区域将这两个 Hook 分别设为“信任”。
+- Codex CLI：运行 `/hooks`，然后信任这两个 Hook。
 
 ### 4. 检查是否可用
 
