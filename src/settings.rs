@@ -32,12 +32,11 @@ impl AppConfig {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not read {}", paths.config.display()));
+                return Err(error).with_context(|| format!("无法读取 {}", paths.config.display()));
             }
         };
         let config: Self = from_str(&contents)
-            .with_context(|| format!("could not parse {}", paths.config.display()))?;
+            .with_context(|| format!("无法解析配置文件 {}", paths.config.display()))?;
         config.validate()?;
         Ok(Some(config))
     }
@@ -45,14 +44,14 @@ impl AppConfig {
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         self.validate()?;
         paths.ensure_directories()?;
-        let contents = to_string_pretty(self).context("could not serialize codex-notify config")?;
+        let contents = to_string_pretty(self).context("无法生成 codex-notify 配置内容")?;
         atomic_write(&paths.config, contents.as_bytes())
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.version != CONFIG_VERSION {
             bail!(
-                "unsupported codex-notify config version {}; expected {}",
+                "不支持 codex-notify 配置版本 {}，当前支持的版本是 {}",
                 self.version,
                 CONFIG_VERSION
             );
@@ -72,10 +71,10 @@ pub struct FeishuConfig {
 impl FeishuConfig {
     pub fn validate(&self) -> Result<()> {
         if self.app_id.trim().is_empty() {
-            bail!("Feishu App ID must not be empty");
+            bail!("飞书 App ID 不能为空");
         }
         if self.receiver_id.trim().is_empty() {
-            bail!("Feishu receiver ID must not be empty");
+            bail!("飞书接收者 ID 不能为空");
         }
         Ok(())
     }
@@ -131,13 +130,13 @@ pub struct InstallationConfig {
 impl InstallationConfig {
     pub fn validate(&self) -> Result<()> {
         if self.managed_notify.len() < 2 {
-            bail!("managed Codex notify command is missing");
+            bail!("缺少由 codex-notify 管理的 Codex notify 命令");
         }
         if self.prompt_hook_marker.trim().is_empty() {
-            bail!("managed prompt Hook marker is missing");
+            bail!("缺少由 codex-notify 管理的 UserPromptSubmit Hook 标记");
         }
         if self.stop_hook_marker.trim().is_empty() {
-            bail!("managed Stop Hook marker is missing");
+            bail!("缺少由 codex-notify 管理的 Stop Hook 标记");
         }
         Ok(())
     }
@@ -149,30 +148,28 @@ fn default_stop_hook_marker() -> String {
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let destination = resolved_write_path(path)?;
-    let parent = destination
-        .parent()
-        .context("configuration path does not have a parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    let parent = destination.parent().context("无法确定配置文件所在目录")?;
+    fs::create_dir_all(parent).with_context(|| format!("无法创建目录 {}", parent.display()))?;
 
     let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
+        .with_context(|| format!("无法在 {} 中创建临时文件", parent.display()))?;
     use std::io::Write;
     temporary
         .write_all(contents)
-        .with_context(|| format!("could not write {}", path.display()))?;
+        .with_context(|| format!("无法写入 {}", path.display()))?;
     temporary
         .flush()
-        .with_context(|| format!("could not flush {}", path.display()))?;
+        .with_context(|| format!("无法保存 {} 的内容", path.display()))?;
 
     #[cfg(windows)]
     if destination.exists() {
         fs::remove_file(&destination)
-            .with_context(|| format!("could not replace {}", destination.display()))?;
+            .with_context(|| format!("无法替换 {}", destination.display()))?;
     }
     temporary
         .persist(&destination)
         .map_err(|error| error.error)
-        .with_context(|| format!("could not save {}", destination.display()))?;
+        .with_context(|| format!("无法保存 {}", destination.display()))?;
     Ok(())
 }
 
@@ -180,11 +177,12 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// configuration manager's symbolic link with a regular file.
 pub fn resolved_write_path(path: &Path) -> Result<PathBuf> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
-            .with_context(|| format!("could not resolve symbolic link {}", path.display())),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(path).with_context(|| format!("无法解析符号链接 {}", path.display()))
+        }
         Ok(_) => Ok(path.to_path_buf()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(error) => Err(error).with_context(|| format!("could not inspect {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法检查 {}", path.display())),
     }
 }
 

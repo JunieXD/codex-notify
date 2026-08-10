@@ -38,7 +38,7 @@ impl AppPaths {
     pub fn ensure_directories(&self) -> Result<()> {
         for path in [&self.root, &self.state, &self.logs, &self.backups] {
             std::fs::create_dir_all(path)
-                .with_context(|| format!("could not create {}", path.display()))?;
+                .with_context(|| format!("无法创建目录 {}", path.display()))?;
         }
         Ok(())
     }

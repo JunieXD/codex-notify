@@ -149,7 +149,7 @@ fn card_value(
 }
 
 fn serialized(value: &Value) -> String {
-    serde_json::to_string(value).expect("Feishu card values must be serializable")
+    serde_json::to_string(value).expect("飞书卡片内容应当可以序列化")
 }
 
 fn fit_card(
@@ -288,7 +288,7 @@ mod tests {
                 .contains("**\u{53d1}\u{9001}\u{65f6}\u{95f4}**")
         );
         assert!(card.serialized_content.contains("**\u{4efb}\u{52a1}**"));
-        assert!(card.serialized_content.contains("1h 1m 1s"));
+        assert!(card.serialized_content.contains("1 小时 1 分 1 秒"));
     }
 
     #[test]

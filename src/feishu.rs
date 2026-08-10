@@ -29,7 +29,7 @@ impl FeishuClient {
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .context("could not create the Feishu HTTP client")?;
+            .context("无法创建飞书网络客户端")?;
         Ok(Self {
             client,
             api_base: FEISHU_API_BASE.to_owned(),
@@ -74,9 +74,8 @@ impl FeishuClient {
                 .json(&payload)
                 .send()
         })?;
-        let response: FeishuResponse<MessageData> =
-            parse_response(response, "send Feishu message")?;
-        ensure_success(&response, "send Feishu message")?;
+        let response: FeishuResponse<MessageData> = parse_response(response, "发送消息")?;
+        ensure_success(&response, "发送消息")?;
 
         Ok(DeliveryReceipt {
             message_id: response.data.and_then(|data| data.message_id),
@@ -93,12 +92,12 @@ impl FeishuClient {
         let response =
             self.send_with_retry(|| self.client.post(&endpoint).json(&payload).send())?;
         let response: FeishuResponse<serde_json::Value> =
-            parse_response(response, "request a Feishu tenant access token")?;
-        ensure_success(&response, "request a Feishu tenant access token")?;
+            parse_response(response, "获取 tenant access token")?;
+        ensure_success(&response, "获取 tenant access token")?;
         response
             .tenant_access_token
             .filter(|token| !token.trim().is_empty())
-            .context("Feishu did not return a tenant access token")
+            .context("飞书没有返回 tenant access token")
     }
 
     fn send_with_retry<F>(&self, mut send: F) -> Result<Response>
@@ -116,13 +115,11 @@ impl FeishuClient {
                     last_error = Some(error);
                     thread::sleep(RETRY_DELAY);
                 }
-                Err(error) => return Err(error).context("could not contact Feishu"),
+                Err(error) => return Err(error).context("无法连接飞书，请检查网络后重试"),
             }
         }
 
-        Err(last_error
-            .context("Feishu request did not produce a response")?
-            .into())
+        Err(last_error.context("飞书请求没有返回响应")?.into())
     }
 }
 
@@ -162,13 +159,13 @@ where
     let status = response.status();
     let body = response
         .text()
-        .with_context(|| format!("could not read Feishu response for {operation}"))?;
+        .with_context(|| format!("飞书{operation}后无法读取响应"))?;
     let parsed: FeishuResponse<T> = serde_json::from_str(&body)
-        .with_context(|| format!("Feishu returned an invalid response for {operation}"))?;
+        .with_context(|| format!("飞书{operation}时返回了无法解析的响应"))?;
 
     if !status.is_success() {
         bail!(
-            "Feishu {operation} failed with HTTP {} (code {}): {}",
+            "飞书{operation}失败：HTTP {}，错误码 {}，{}",
             status.as_u16(),
             parsed.code,
             safe_message(&parsed.msg)
@@ -180,7 +177,7 @@ where
 fn ensure_success<T>(response: &FeishuResponse<T>, operation: &str) -> Result<()> {
     if response.code != 0 {
         bail!(
-            "Feishu {operation} failed (code {}): {}",
+            "飞书{operation}失败：错误码 {}，{}",
             response.code,
             safe_message(&response.msg)
         );

@@ -175,7 +175,7 @@ pub fn remove_notify_integration(
 }
 
 pub fn parse_forward_notify(value: &str) -> Result<Vec<String>> {
-    parse_command_json(value, "codex-notify forwarded notifier")
+    parse_command_json(value, "codex-notify 转发通知命令")
 }
 
 fn validate_canonical_managed(command: &[String]) -> Result<()> {
@@ -184,7 +184,7 @@ fn validate_canonical_managed(command: &[String]) -> Result<()> {
         || command[1] != "notify"
         || command[2] != MANAGED_NOTIFY_FLAG
     {
-        bail!("managed codex-notify command has an unsupported shape");
+        bail!("由 codex-notify 管理的通知命令格式不受支持");
     }
     Ok(())
 }
@@ -197,13 +197,10 @@ fn with_forward_notify(
     let mut command = canonical_managed.to_vec();
     if let Some(previous) = previous {
         if previous.is_empty() {
-            bail!("cannot forward to an empty notifier command");
+            bail!("无法转发到空的通知命令");
         }
         command.push(FORWARD_NOTIFY_FLAG.to_owned());
-        command.push(
-            serde_json::to_string(previous)
-                .context("could not serialize the forwarded notifier command")?,
-        );
+        command.push(serde_json::to_string(previous).context("无法生成转发通知命令")?);
     }
     Ok(command)
 }
@@ -228,27 +225,23 @@ fn parse_managed_command(
         match command[index].as_str() {
             MANAGED_NOTIFY_FLAG => {
                 if managed_marker {
-                    bail!(
-                        "managed codex-notify command contains a duplicate {MANAGED_NOTIFY_FLAG}"
-                    );
+                    bail!("由 codex-notify 管理的通知命令重复包含 {MANAGED_NOTIFY_FLAG}");
                 }
                 managed_marker = true;
                 index += 1;
             }
             FORWARD_NOTIFY_FLAG => {
                 if forward.is_some() {
-                    bail!(
-                        "managed codex-notify command contains a duplicate {FORWARD_NOTIFY_FLAG}"
-                    );
+                    bail!("由 codex-notify 管理的通知命令重复包含 {FORWARD_NOTIFY_FLAG}");
                 }
                 let value = command
                     .get(index + 1)
-                    .context("managed codex-notify command is missing its forwarded notifier")?;
+                    .context("由 codex-notify 管理的通知命令缺少转发目标")?;
                 forward = Some(parse_forward_notify(value)?);
                 index += 2;
             }
             argument => {
-                bail!("managed codex-notify command contains unsupported argument '{argument}'");
+                bail!("由 codex-notify 管理的通知命令包含不支持的参数“{argument}”");
             }
         }
     }
@@ -271,7 +264,7 @@ fn split_computer_use_layers(
         };
         depth += 1;
         if depth > MAX_COMPUTER_USE_LAYERS {
-            bail!("Computer Use notify nesting exceeds the supported limit");
+            bail!("Computer Use notify 嵌套层数超过支持上限");
         }
         current = wrapper.previous_notify.clone();
         if outer.is_none() {
@@ -288,7 +281,7 @@ fn normalize_downstream(
     let (_, leaf) = split_computer_use_layers(previous)?;
     if let Some(command) = leaf.as_ref() {
         if parse_managed_command(command, managed_programs)?.is_some() {
-            bail!("refusing to create a recursive codex-notify command");
+            bail!("检测到递归的 codex-notify 通知命令，已停止修改以保护配置");
         }
         reject_foreign_codex_notify(command)?;
     }
@@ -303,9 +296,7 @@ fn reject_foreign_codex_notify(command: &[String]) -> Result<()> {
                 || name.eq_ignore_ascii_case("codex-notify.exe")
         })
     {
-        bail!(
-            "another codex-notify command is already configured; refusing to create a recursive chain"
-        );
+        bail!("当前已配置另一个 codex-notify 通知命令，已停止修改以避免形成递归调用");
     }
     Ok(())
 }
@@ -323,9 +314,7 @@ impl ComputerUseCommand {
         {
             let normalized = name.to_ascii_lowercase();
             if normalized.contains("computeruse") || normalized.contains("computer-use") {
-                bail!(
-                    "unsupported Computer Use notify executable '{name}'; refusing to rewrite it"
-                );
+                bail!("不支持当前 Computer Use 通知程序“{name}”，已停止修改以保护配置");
             }
             return Ok(None);
         }
@@ -336,15 +325,12 @@ impl ComputerUseCommand {
         while index < command.len() {
             if command[index] == COMPUTER_USE_PREVIOUS_FLAG {
                 if previous_flag_index.is_some() {
-                    bail!(
-                        "Computer Use notify command contains a duplicate {COMPUTER_USE_PREVIOUS_FLAG}"
-                    );
+                    bail!("Computer Use notify 命令重复包含 {COMPUTER_USE_PREVIOUS_FLAG}");
                 }
                 let value = command
                     .get(index + 1)
-                    .context("Computer Use notify command is missing its previous notifier")?;
-                previous_notify =
-                    Some(parse_command_json(value, "Computer Use previous notifier")?);
+                    .context("Computer Use notify 命令缺少原通知命令")?;
+                previous_notify = Some(parse_command_json(value, "Computer Use 原通知命令")?);
                 previous_flag_index = Some(index);
                 index += 2;
             } else {
@@ -363,8 +349,8 @@ impl ComputerUseCommand {
         let mut command = self.command.clone();
         match (self.previous_flag_index, previous) {
             (Some(index), Some(previous)) => {
-                command[index + 1] = serde_json::to_string(&previous)
-                    .context("could not serialize Computer Use previous notifier")?;
+                command[index + 1] =
+                    serde_json::to_string(&previous).context("无法生成 Computer Use 原通知命令")?;
             }
             (Some(index), None) => {
                 command.drain(index..=index + 1);
@@ -372,8 +358,7 @@ impl ComputerUseCommand {
             (None, Some(previous)) => {
                 command.push(COMPUTER_USE_PREVIOUS_FLAG.to_owned());
                 command.push(
-                    serde_json::to_string(&previous)
-                        .context("could not serialize Computer Use previous notifier")?,
+                    serde_json::to_string(&previous).context("无法生成 Computer Use 原通知命令")?,
                 );
             }
             (None, None) => {}
@@ -383,10 +368,10 @@ impl ComputerUseCommand {
 }
 
 fn parse_command_json(value: &str, label: &str) -> Result<Vec<String>> {
-    let command: Vec<String> = serde_json::from_str(value)
-        .with_context(|| format!("{label} must be a JSON string array"))?;
+    let command: Vec<String> =
+        serde_json::from_str(value).with_context(|| format!("{label}必须是 JSON 字符串数组"))?;
     if command.is_empty() || command[0].trim().is_empty() {
-        bail!("{label} must not be empty");
+        bail!("{label}不能为空");
     }
     Ok(command)
 }
@@ -643,7 +628,7 @@ mod tests {
         ];
         let error = plan_notify_integration(Some(active), &managed(), &programs(), None)
             .expect_err("malformed wrapper must fail");
-        assert!(error.to_string().contains("JSON string array"));
+        assert!(error.to_string().contains("JSON 字符串数组"));
     }
 
     #[test]
@@ -654,7 +639,7 @@ mod tests {
         ];
         let error = plan_notify_integration(Some(active), &managed(), &programs(), None)
             .expect_err("unknown Computer Use format must fail closed");
-        assert!(error.to_string().contains("unsupported Computer Use"));
+        assert!(error.to_string().contains("不支持当前 Computer Use"));
     }
 
     #[test]
@@ -666,6 +651,6 @@ mod tests {
         ];
         let error = plan_notify_integration(Some(active), &managed(), &programs(), None)
             .expect_err("foreign installation must fail");
-        assert!(error.to_string().contains("another codex-notify"));
+        assert!(error.to_string().contains("另一个 codex-notify"));
     }
 }

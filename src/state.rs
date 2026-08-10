@@ -47,32 +47,26 @@ pub fn turn_state_path(state_directory: &Path, turn_id: &str) -> Option<PathBuf>
 }
 
 pub fn write_turn_state(state_directory: &Path, turn_id: &str, state: &TurnState) -> Result<()> {
-    let destination = turn_state_path(state_directory, turn_id)
-        .context("a Codex turn ID is required to store task context")?;
+    let destination =
+        turn_state_path(state_directory, turn_id).context("保存任务上下文时缺少 Codex turn ID")?;
     fs::create_dir_all(state_directory)
-        .with_context(|| format!("could not create {}", state_directory.display()))?;
+        .with_context(|| format!("无法创建目录 {}", state_directory.display()))?;
 
-    let contents = serde_json::to_vec(state).context("could not serialize turn state")?;
-    let mut temporary = NamedTempFile::new_in(state_directory).with_context(|| {
-        format!(
-            "could not create state file in {}",
-            state_directory.display()
-        )
-    })?;
-    temporary
-        .write_all(&contents)
-        .context("could not write turn state")?;
-    temporary.flush().context("could not flush turn state")?;
+    let contents = serde_json::to_vec(state).context("无法生成任务状态数据")?;
+    let mut temporary = NamedTempFile::new_in(state_directory)
+        .with_context(|| format!("无法在 {} 中创建状态文件", state_directory.display()))?;
+    temporary.write_all(&contents).context("无法写入任务状态")?;
+    temporary.flush().context("无法保存任务状态")?;
 
     #[cfg(windows)]
     if destination.exists() {
         fs::remove_file(&destination)
-            .with_context(|| format!("could not replace {}", destination.display()))?;
+            .with_context(|| format!("无法替换 {}", destination.display()))?;
     }
     temporary
         .persist(&destination)
         .map_err(|error| error.error)
-        .with_context(|| format!("could not store {}", destination.display()))?;
+        .with_context(|| format!("无法保存 {}", destination.display()))?;
     Ok(())
 }
 
@@ -84,12 +78,12 @@ pub fn load_turn_state(state_directory: &Path, turn_id: &str) -> Result<Option<T
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", path.display()));
         }
     };
 
     let state = serde_json::from_slice(&contents)
-        .with_context(|| format!("could not parse {}", path.display()))?;
+        .with_context(|| format!("无法解析状态文件 {}", path.display()))?;
     Ok(Some(state))
 }
 
@@ -100,7 +94,7 @@ pub fn remove_turn_state(state_directory: &Path, turn_id: &str) -> Result<()> {
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法删除 {}", path.display())),
     }
 }
 
@@ -116,26 +110,21 @@ pub fn prune_turn_states(state_directory: &Path, maximum_age: Duration) -> Resul
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("could not read {}", state_directory.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", state_directory.display()));
         }
     };
 
     for entry in entries {
-        let entry = entry.context("could not read a turn-state entry")?;
+        let entry = entry.context("无法读取任务状态项目")?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .context("could not inspect a turn-state entry")?;
-        let modified = metadata
-            .modified()
-            .context("could not read state file modification time")?;
+        let metadata = entry.metadata().context("无法检查任务状态项目")?;
+        let modified = metadata.modified().context("无法读取状态文件修改时间")?;
         if now.duration_since(modified).unwrap_or_default() > maximum_age {
             fs::remove_file(&path)
-                .with_context(|| format!("could not remove stale state {}", path.display()))?;
+                .with_context(|| format!("无法删除过期状态 {}", path.display()))?;
             removed += 1;
         }
     }

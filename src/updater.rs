@@ -49,7 +49,7 @@ struct LatestRelease {
 }
 
 pub fn current_version() -> Result<Version> {
-    Version::parse(env!("CARGO_PKG_VERSION")).context("the installed version is not valid semver")
+    Version::parse(env!("CARGO_PKG_VERSION")).context("当前程序版本不是有效的语义化版本")
 }
 
 pub fn parse_version(value: &str) -> Result<Version> {
@@ -60,31 +60,22 @@ pub fn executable_version(executable: &Path) -> Result<Version> {
     let output = Command::new(executable)
         .arg("--version")
         .output()
-        .with_context(|| format!("could not run {} --version", executable.display()))?;
+        .with_context(|| format!("无法运行 {} --version", executable.display()))?;
     if !output.status.success() {
         bail!(
-            "{} --version failed ({})",
+            "{} --version 执行失败（{}）",
             executable.display(),
             output.status
         );
     }
-    let reported = String::from_utf8(output.stdout)
-        .context("the installed executable returned a non-UTF-8 version")?;
+    let reported =
+        String::from_utf8(output.stdout).context("已安装程序返回的版本信息不是有效 UTF-8")?;
     let version = reported
         .trim()
         .strip_prefix("codex-notify ")
-        .with_context(|| {
-            format!(
-                "{} returned an unexpected version string",
-                executable.display()
-            )
-        })?;
-    Version::parse(version).with_context(|| {
-        format!(
-            "{} returned an invalid semantic version '{version}'",
-            executable.display()
-        )
-    })
+        .with_context(|| format!("{} 返回了无法识别的版本信息", executable.display()))?;
+    Version::parse(version)
+        .with_context(|| format!("{} 返回了无效的语义化版本“{version}”", executable.display()))
 }
 
 pub fn resolve_release(
@@ -114,9 +105,7 @@ pub fn resolve_release(
 
 pub fn update_needed(current: &Version, target: &Version, force: bool) -> Result<bool> {
     if target < current && !force {
-        bail!(
-            "v{target} is older than the installed v{current}; pass --force to downgrade explicitly"
-        );
+        bail!("目标版本 v{target} 早于当前版本 v{current}；如需降级，请明确添加 --force");
     }
     Ok(force || target != current)
 }
@@ -126,21 +115,16 @@ pub fn prepare_release(info: ReleaseInfo, staging_parent: &Path) -> Result<Prepa
     let archive_url = format!("{}/{}", info.download_base, info.asset_name);
     let checksum_url = format!("{}/SHA256SUMS", info.download_base);
     let archive = download_limited(&client, &archive_url, MAX_ARCHIVE_BYTES)
-        .with_context(|| format!("could not download {}", info.asset_name))?;
+        .with_context(|| format!("无法下载 {}", info.asset_name))?;
     let checksums = download_limited(&client, &checksum_url, MAX_CHECKSUM_BYTES)
-        .context("could not download SHA256SUMS")?;
-    let checksums = std::str::from_utf8(&checksums).context("SHA256SUMS is not valid UTF-8")?;
+        .context("无法下载 SHA256SUMS")?;
+    let checksums = std::str::from_utf8(&checksums).context("SHA256SUMS 不是有效的 UTF-8 文件")?;
     verify_checksum(&archive, checksums, &info.asset_name)?;
 
     let directory = tempfile::Builder::new()
         .prefix("codex-notify-update-")
         .tempdir_in(staging_parent)
-        .with_context(|| {
-            format!(
-                "could not create the update staging directory in {}",
-                staging_parent.display()
-            )
-        })?;
+        .with_context(|| format!("无法在 {} 中创建升级临时目录", staging_parent.display()))?;
     let archive_path = directory.path().join(&info.asset_name);
     write_file(&archive_path, &archive)?;
     let executable_name = release_executable_name();
@@ -160,27 +144,18 @@ impl PreparedRelease {
     pub fn backup_current_executable(&self, current_executable: &Path) -> Result<ExecutableBackup> {
         let parent = current_executable
             .parent()
-            .context("the installed executable does not have a parent directory")?;
+            .context("无法确定已安装程序所在目录")?;
         let backup = tempfile::Builder::new()
             .prefix(".codex-notify-backup-")
             .suffix(if cfg!(windows) { ".exe" } else { "" })
             .tempfile_in(parent)
-            .with_context(|| {
-                format!(
-                    "could not create an executable backup in {}",
-                    parent.display()
-                )
-            })?;
-        fs::copy(current_executable, backup.path()).with_context(|| {
-            format!(
-                "could not back up the installed executable {}",
-                current_executable.display()
-            )
-        })?;
+            .with_context(|| format!("无法在 {} 中创建程序备份", parent.display()))?;
+        fs::copy(current_executable, backup.path())
+            .with_context(|| format!("无法备份已安装程序 {}", current_executable.display()))?;
         backup
             .as_file()
             .sync_all()
-            .with_context(|| format!("could not flush {}", backup.path().display()))?;
+            .with_context(|| format!("无法保存 {}", backup.path().display()))?;
         Ok(ExecutableBackup {
             path: backup.into_temp_path(),
         })
@@ -188,12 +163,8 @@ impl PreparedRelease {
 }
 
 pub fn replace_current_executable(new_executable: &Path) -> Result<()> {
-    self_replace::self_replace(new_executable).with_context(|| {
-        format!(
-            "could not replace the running executable with {}",
-            new_executable.display()
-        )
-    })
+    self_replace::self_replace(new_executable)
+        .with_context(|| format!("无法使用 {} 替换当前程序", new_executable.display()))
 }
 
 /// Atomically install an executable that is not the currently running process.
@@ -201,15 +172,13 @@ pub fn replace_current_executable(new_executable: &Path) -> Result<()> {
 /// The caller is responsible for keeping a backup when replacing an existing
 /// executable. On Windows the destination must not be running.
 pub fn install_executable(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("the executable destination does not have a parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    let parent = destination.parent().context("无法确定程序安装目录")?;
+    fs::create_dir_all(parent).with_context(|| format!("无法创建目录 {}", parent.display()))?;
     let temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("could not create an update file in {}", parent.display()))?;
+        .with_context(|| format!("无法在 {} 中创建升级文件", parent.display()))?;
     fs::copy(source, temporary.path()).with_context(|| {
         format!(
-            "could not stage executable {} for {}",
+            "无法暂存程序 {} 以安装到 {}",
             source.display(),
             destination.display()
         )
@@ -218,7 +187,7 @@ pub fn install_executable(source: &Path, destination: &Path) -> Result<()> {
     temporary
         .as_file()
         .sync_all()
-        .with_context(|| format!("could not flush {}", temporary.path().display()))?;
+        .with_context(|| format!("无法保存 {}", temporary.path().display()))?;
 
     #[cfg(windows)]
     if destination.exists() {
@@ -228,7 +197,7 @@ pub fn install_executable(source: &Path, destination: &Path) -> Result<()> {
     temporary
         .persist(destination)
         .map_err(|error| error.error)
-        .with_context(|| format!("could not install {}", destination.display()))?;
+        .with_context(|| format!("无法安装 {}", destination.display()))?;
     Ok(())
 }
 
@@ -247,8 +216,7 @@ pub fn remove_executable(destination: &Path) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not replace {}", destination.display()));
+                return Err(error).with_context(|| format!("无法替换 {}", destination.display()));
             }
         }
     }
@@ -259,15 +227,13 @@ pub fn remove_executable(destination: &Path) -> Result<()> {
     match fs::remove_file(destination) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("could not remove {}", destination.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("无法删除 {}", destination.display())),
     }
 }
 
 fn validate_repository(repository: &str) -> Result<()> {
     let Some((owner, name)) = repository.split_once('/') else {
-        bail!("repository must use the owner/name format");
+        bail!("仓库地址必须使用 owner/name 格式");
     };
     if owner.is_empty()
         || name.is_empty()
@@ -275,7 +241,7 @@ fn validate_repository(repository: &str) -> Result<()> {
         || !owner.chars().all(repository_character)
         || !name.chars().all(repository_character)
     {
-        bail!("repository must use the owner/name format");
+        bail!("仓库地址必须使用 owner/name 格式");
     }
     Ok(())
 }
@@ -287,8 +253,8 @@ fn repository_character(character: char) -> bool {
 fn normalized_tag(value: &str) -> Result<(String, Version)> {
     let value = value.trim();
     let version_text = value.strip_prefix('v').unwrap_or(value);
-    let version = Version::parse(version_text)
-        .with_context(|| format!("'{value}' is not a valid semantic version"))?;
+    let version =
+        Version::parse(version_text).with_context(|| format!("“{value}”不是有效的语义化版本"))?;
     Ok((format!("v{version}"), version))
 }
 
@@ -297,11 +263,11 @@ fn latest_release_tag(client: &Client, repository: &str) -> Result<String> {
     let release = client
         .get(&url)
         .send()
-        .context("could not query the latest GitHub Release")?
+        .context("无法查询最新 GitHub Release")?
         .error_for_status()
-        .context("GitHub did not return a latest release")?
+        .context("GitHub 没有返回最新发行版")?
         .json::<LatestRelease>()
-        .context("could not parse the latest GitHub Release")?;
+        .context("无法解析最新 GitHub Release")?;
     Ok(release.tag_name)
 }
 
@@ -311,16 +277,16 @@ fn http_client() -> Result<Client> {
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
         .build()
-        .context("could not create the update HTTP client")
+        .context("无法创建升级网络客户端")
 }
 
 fn download_limited(client: &Client, url: &str, maximum: u64) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
-        .with_context(|| format!("could not request {url}"))?
+        .with_context(|| format!("无法请求 {url}"))?
         .error_for_status()
-        .with_context(|| format!("download failed for {url}"))?;
+        .with_context(|| format!("下载失败：{url}"))?;
     read_limited(response, maximum)
 }
 
@@ -329,15 +295,15 @@ fn read_limited(response: Response, maximum: u64) -> Result<Vec<u8>> {
         .content_length()
         .is_some_and(|length| length > maximum)
     {
-        bail!("download exceeds the allowed size");
+        bail!("下载内容超过允许大小");
     }
     let mut bytes = Vec::new();
     response
         .take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
-        .context("could not read the download")?;
+        .context("无法读取下载内容")?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
-        bail!("download exceeds the allowed size");
+        bail!("下载内容超过允许大小");
     }
     Ok(bytes)
 }
@@ -346,7 +312,7 @@ fn verify_checksum(archive: &[u8], checksums: &str, asset_name: &str) -> Result<
     let expected = checksum_for_asset(checksums, asset_name)?;
     let actual = format!("{:x}", Sha256::digest(archive));
     if actual != expected {
-        bail!("SHA-256 verification failed for {asset_name}");
+        bail!("{asset_name} 的 SHA-256 校验失败，为保护安装安全，已停止升级");
     }
     Ok(())
 }
@@ -370,22 +336,22 @@ fn checksum_for_asset(checksums: &str, asset_name: &str) -> Result<String> {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
         {
-            bail!("SHA256SUMS contains an invalid checksum for {asset_name}");
+            bail!("SHA256SUMS 中 {asset_name} 的校验值无效");
         }
         if found.replace(normalized).is_some() {
-            bail!("SHA256SUMS contains more than one checksum for {asset_name}");
+            bail!("SHA256SUMS 中包含多个 {asset_name} 校验值");
         }
     }
-    found.with_context(|| format!("SHA256SUMS does not contain {asset_name}"))
+    found.with_context(|| format!("SHA256SUMS 中没有 {asset_name} 的校验值"))
 }
 
 fn write_file(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("could not create update file {}", path.display()))?;
+    let mut file =
+        File::create(path).with_context(|| format!("无法创建升级文件 {}", path.display()))?;
     file.write_all(contents)
-        .with_context(|| format!("could not write update file {}", path.display()))?;
+        .with_context(|| format!("无法写入升级文件 {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("could not flush update file {}", path.display()))
+        .with_context(|| format!("无法保存升级文件 {}", path.display()))
 }
 
 fn extract_release_executable(
@@ -405,33 +371,30 @@ fn extract_tar_executable(
     destination: &Path,
     executable_name: &str,
 ) -> Result<()> {
-    let file = File::open(archive_path)
-        .with_context(|| format!("could not open {}", archive_path.display()))?;
+    let file =
+        File::open(archive_path).with_context(|| format!("无法打开 {}", archive_path.display()))?;
     let mut archive = tar::Archive::new(GzDecoder::new(file));
-    for entry in archive
-        .entries()
-        .context("could not read the release archive")?
-    {
-        let mut entry = entry.context("could not read a release archive entry")?;
+    for entry in archive.entries().context("无法读取发行版压缩包")? {
+        let mut entry = entry.context("无法读取发行版压缩包中的文件")?;
         if !entry.header().entry_type().is_file()
             || entry
                 .path()
-                .context("release archive path is invalid")?
+                .context("发行版压缩包中的文件路径无效")?
                 .as_ref()
                 != Path::new(executable_name)
         {
             continue;
         }
         let mut output = File::create(destination)
-            .with_context(|| format!("could not create {}", destination.display()))?;
+            .with_context(|| format!("无法创建 {}", destination.display()))?;
         std::io::copy(&mut entry, &mut output)
-            .with_context(|| format!("could not extract {executable_name}"))?;
+            .with_context(|| format!("无法解压 {executable_name}"))?;
         output
             .sync_all()
-            .with_context(|| format!("could not flush {}", destination.display()))?;
+            .with_context(|| format!("无法保存 {}", destination.display()))?;
         return Ok(());
     }
-    bail!("release archive does not contain {executable_name}")
+    bail!("发行版压缩包中没有 {executable_name}")
 }
 
 fn extract_zip_executable(
@@ -439,33 +402,33 @@ fn extract_zip_executable(
     destination: &Path,
     executable_name: &str,
 ) -> Result<()> {
-    let file = File::open(archive_path)
-        .with_context(|| format!("could not open {}", archive_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("could not read the release ZIP")?;
+    let file =
+        File::open(archive_path).with_context(|| format!("无法打开 {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("无法读取发行版 ZIP")?;
     let mut entry = archive
         .by_name(executable_name)
-        .with_context(|| format!("release ZIP does not contain {executable_name}"))?;
+        .with_context(|| format!("发行版 ZIP 中没有 {executable_name}"))?;
     if !entry.is_file() {
-        bail!("release ZIP entry {executable_name} is not a file");
+        bail!("发行版 ZIP 中的 {executable_name} 不是文件");
     }
-    let mut output = File::create(destination)
-        .with_context(|| format!("could not create {}", destination.display()))?;
+    let mut output =
+        File::create(destination).with_context(|| format!("无法创建 {}", destination.display()))?;
     std::io::copy(&mut entry, &mut output)
-        .with_context(|| format!("could not extract {executable_name}"))?;
+        .with_context(|| format!("无法解压 {executable_name}"))?;
     output
         .sync_all()
-        .with_context(|| format!("could not flush {}", destination.display()))
+        .with_context(|| format!("无法保存 {}", destination.display()))
 }
 
 #[cfg(unix)]
 fn set_executable_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = fs::metadata(path)
-        .with_context(|| format!("could not inspect {}", path.display()))?
+        .with_context(|| format!("无法检查 {}", path.display()))?
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions)
-        .with_context(|| format!("could not make {} executable", path.display()))
+        .with_context(|| format!("无法为 {} 添加可执行权限", path.display()))
 }
 
 #[cfg(not(unix))]
@@ -474,14 +437,10 @@ fn set_executable_permissions(_path: &Path) -> Result<()> {
 }
 
 fn verify_executable_version(executable: &Path, expected: &Version) -> Result<()> {
-    let reported = executable_version(executable).with_context(|| {
-        format!(
-            "could not verify staged executable {}",
-            executable.display()
-        )
-    })?;
+    let reported = executable_version(executable)
+        .with_context(|| format!("无法验证暂存程序 {}", executable.display()))?;
     if &reported != expected {
-        bail!("the staged executable reported v{reported}, expected v{expected}");
+        bail!("暂存程序报告版本 v{reported}，预期应为 v{expected}");
     }
     Ok(())
 }
@@ -489,7 +448,7 @@ fn verify_executable_version(executable: &Path, expected: &Version) -> Result<()
 fn current_asset_name() -> Result<String> {
     asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
         .map(ToOwned::to_owned)
-        .context("codex-notify updates are not available for this platform")
+        .context("当前平台暂不支持 codex-notify 自动升级")
 }
 
 fn asset_name_for(os: &str, architecture: &str) -> Option<&'static str> {

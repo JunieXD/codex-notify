@@ -794,7 +794,7 @@ fn with_state<T>(
     operation: impl FnOnce(&mut MonitorState, bool) -> Result<T>,
 ) -> Result<T> {
     fs::create_dir_all(&paths.state)
-        .with_context(|| format!("could not create {}", paths.state.display()))?;
+        .with_context(|| format!("无法创建目录 {}", paths.state.display()))?;
     let lock_path = paths.state.join("monitor.lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -802,16 +802,16 @@ fn with_state<T>(
         .write(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("could not open {}", lock_path.display()))?;
+        .with_context(|| format!("无法打开 {}", lock_path.display()))?;
     lock.lock_exclusive()
-        .with_context(|| format!("could not lock {}", lock_path.display()))?;
+        .with_context(|| format!("无法锁定 {}", lock_path.display()))?;
 
     let result = (|| {
         let state_path = monitor_state_path(paths);
         let first_run = !state_path.exists();
         let mut state = load_state(&state_path)?;
         let result = operation(&mut state, first_run)?;
-        let contents = serde_json::to_vec(&state).context("could not serialize monitor state")?;
+        let contents = serde_json::to_vec(&state).context("无法生成后台监听状态数据")?;
         atomic_write(&state_path, &contents)?;
         Ok(result)
     })();
@@ -826,10 +826,11 @@ fn load_state(path: &Path) -> Result<MonitorState> {
             return Ok(MonitorState::default());
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", path.display()));
         }
     };
-    serde_json::from_slice(&contents).with_context(|| format!("could not parse {}", path.display()))
+    serde_json::from_slice(&contents)
+        .with_context(|| format!("无法解析状态文件 {}", path.display()))
 }
 
 #[cfg(test)]

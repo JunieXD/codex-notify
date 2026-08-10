@@ -89,11 +89,11 @@ pub fn format_duration(duration: Duration) -> String {
     let seconds = total_seconds % 60;
 
     if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
+        format!("{hours} 小时 {minutes} 分 {seconds} 秒")
     } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
+        format!("{minutes} 分 {seconds} 秒")
     } else {
-        format!("{seconds}s")
+        format!("{seconds} 秒")
     }
 }
 
@@ -104,8 +104,11 @@ mod tests {
 
     #[test]
     fn formats_duration_for_seconds_minutes_and_hours() {
-        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
-        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
-        assert_eq!(format_duration(Duration::from_secs(3_661)), "1h 1m 1s");
+        assert_eq!(format_duration(Duration::from_secs(5)), "5 秒");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1 分 5 秒");
+        assert_eq!(
+            format_duration(Duration::from_secs(3_661)),
+            "1 小时 1 分 1 秒"
+        );
     }
 }

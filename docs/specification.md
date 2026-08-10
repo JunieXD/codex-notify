@@ -86,17 +86,20 @@ keep command-line flags available for non-interactive automation.
 ### 5.2 `init` flow
 
 1. Detect the operating system and existing Codex user configuration.
-2. Detect an existing `notify` command and existing `hooks.json` entries.
-3. Explain exactly which files and background task will be changed.
-4. Ask for Feishu App ID, App Secret, receiver type, and receiver identifier.
-5. Store the App Secret in the OS credential store.
-6. Write non-secret configuration.
-7. Install the completion dispatcher, UserPromptSubmit Hook, and Stop Hook without
+2. If codex-notify is already configured, show a non-secret summary and explain
+   that initialization is not required. Default to keeping the current
+   configuration; continue only after the user explicitly chooses to reconfigure.
+3. Detect an existing `notify` command and existing `hooks.json` entries.
+4. Explain exactly which files, credentials, and background task will be changed.
+5. Ask for Feishu App ID, App Secret, receiver type, and receiver identifier.
+6. Store the App Secret in the OS credential store.
+7. Write non-secret configuration and keep a backup when replacing it.
+8. Install the completion dispatcher, UserPromptSubmit Hook, and Stop Hook without
    deleting unrelated user configuration.
-8. Install the platform background watcher without administrator privileges.
-9. Send an opt-in test notification and report its result.
-10. Explain that Codex requires the user to review and trust the new Hooks.
-11. Print a concise status summary.
+9. Install the platform background watcher without administrator privileges.
+10. Send an opt-in test notification and report its result.
+11. Explain that Codex requires the user to review and trust the new Hooks.
+12. Print a concise status summary.
 
 The interactive flow must use concise Chinese guidance. Before each value it
 explains where to obtain the value and what format to expect. App Secret input
@@ -108,6 +111,11 @@ defaults to yes because the preceding summary already explains every change and
 the automatic backups. After installation, ChatGPT App users are told to open
 Settings, enter Hooks, and trust the UserPromptSubmit and Stop Hooks in the user
 section; Codex CLI users are told to run `/hooks` and trust the same two Hooks.
+
+All human-facing command help, progress, status, diagnostics, update, uninstall,
+installer, and error messages use concise Simplified Chinese. Stable command
+names, option names, protocol values, and `--json` keys remain unchanged for
+compatibility and automation.
 
 The Stop Hook never sends an interruption card immediately. It only creates a
 pending candidate, which the watcher confirms using the same rules as a

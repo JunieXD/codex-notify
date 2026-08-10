@@ -78,15 +78,15 @@ impl TranscriptSource for JsonlTranscriptSource {
 /// final line. This makes a later watcher pass safely retry a record while
 /// Codex is still appending it.
 pub fn read_events_from(path: &Path, start_offset: u64) -> Result<ReadResult> {
-    let mut file = File::open(path)
-        .with_context(|| format!("could not open transcript {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("无法打开 Codex 任务记录 {}", path.display()))?;
     let length = file
         .metadata()
-        .with_context(|| format!("could not inspect transcript {}", path.display()))?
+        .with_context(|| format!("无法检查 Codex 任务记录 {}", path.display()))?
         .len();
     let start_offset = start_offset.min(length);
     file.seek(SeekFrom::Start(start_offset))
-        .with_context(|| format!("could not seek transcript {}", path.display()))?;
+        .with_context(|| format!("无法定位 Codex 任务记录 {}", path.display()))?;
 
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
@@ -97,7 +97,7 @@ pub fn read_events_from(path: &Path, start_offset: u64) -> Result<ReadResult> {
         let line_start = offset;
         line.clear();
         let line_read = read_bounded_line(&mut reader, &mut line)
-            .with_context(|| format!("could not read transcript {}", path.display()))?;
+            .with_context(|| format!("无法读取 Codex 任务记录 {}", path.display()))?;
         let BoundedLine::Complete { bytes, too_large } = line_read else {
             // The JSON record has not been fully written yet. Leave the
             // cursor at its beginning so the next pass can parse it intact.

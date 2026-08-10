@@ -54,7 +54,7 @@ pub fn install_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = (paths, binary);
-        bail!("the background watcher is supported on macOS, Windows, and Linux only")
+        bail!("后台监听仅支持 macOS、Windows 和 Linux")
     }
 }
 
@@ -74,7 +74,7 @@ pub fn uninstall_watcher(_paths: &AppPaths) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = _paths;
-        bail!("the background watcher is supported on macOS, Windows, and Linux only")
+        bail!("后台监听仅支持 macOS、Windows 和 Linux")
     }
 }
 
@@ -100,7 +100,7 @@ pub fn stop_watcher(_paths: &AppPaths) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = _paths;
-        bail!("the background watcher is supported on macOS, Windows, and Linux only")
+        bail!("后台监听仅支持 macOS、Windows 和 Linux")
     }
 }
 
@@ -135,7 +135,7 @@ pub fn watcher_location() -> Result<String> {
     #[cfg(target_os = "windows")]
     {
         Ok(format!(
-            "Registry: HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"
+            "注册表：HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}"
         ))
     }
     #[cfg(target_os = "linux")]
@@ -144,7 +144,7 @@ pub fn watcher_location() -> Result<String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        bail!("the background watcher is supported on macOS, Windows, and Linux only")
+        bail!("后台监听仅支持 macOS、Windows 和 Linux")
     }
 }
 
@@ -154,7 +154,7 @@ fn install_macos_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     let previous = fs::read(&plist_path).ok();
     if previous.is_some() && !is_managed_macos_plist(&plist_path) {
         bail!(
-            "refusing to overwrite user-managed LaunchAgent {}",
+            "{} 是用户自行管理的 LaunchAgent，为保护现有配置，codex-notify 不会覆盖它",
             plist_path.display()
         );
     }
@@ -169,7 +169,7 @@ fn install_macos_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     let status = Command::new("/bin/launchctl")
         .args(["bootstrap", &domain, &plist_path.display().to_string()])
         .status()
-        .context("could not run launchctl bootstrap")?;
+        .context("无法运行 launchctl bootstrap")?;
     if status.success() {
         return Ok(());
     }
@@ -180,7 +180,7 @@ fn install_macos_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
             let _ = fs::remove_file(&plist_path);
         }
     }
-    bail!("launchctl could not start the codex-notify watcher ({status})")
+    bail!("launchctl 未能启动 codex-notify 后台监听（{status}）")
 }
 
 #[cfg(target_os = "macos")]
@@ -191,7 +191,7 @@ fn uninstall_macos_watcher() -> Result<()> {
     }
     if !is_managed_macos_plist(&plist_path) {
         bail!(
-            "refusing to remove user-managed LaunchAgent {}",
+            "{} 是用户自行管理的 LaunchAgent，为保护现有配置，codex-notify 不会删除它",
             plist_path.display()
         );
     }
@@ -200,8 +200,7 @@ fn uninstall_macos_watcher() -> Result<()> {
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &domain, &plist_path.display().to_string()])
         .status();
-    fs::remove_file(&plist_path)
-        .with_context(|| format!("could not remove {}", plist_path.display()))?;
+    fs::remove_file(&plist_path).with_context(|| format!("无法删除 {}", plist_path.display()))?;
     Ok(())
 }
 
@@ -213,7 +212,7 @@ fn stop_macos_watcher() -> Result<()> {
     }
     if !is_managed_macos_plist(&plist_path) {
         bail!(
-            "refusing to stop user-managed LaunchAgent {}",
+            "{} 是用户自行管理的 LaunchAgent，codex-notify 不会停止它",
             plist_path.display()
         );
     }
@@ -222,7 +221,7 @@ fn stop_macos_watcher() -> Result<()> {
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &domain, &plist_path.display().to_string()])
         .status()
-        .context("could not run launchctl bootout")?;
+        .context("无法运行 launchctl bootout")?;
     Ok(())
 }
 
@@ -230,7 +229,7 @@ fn stop_macos_watcher() -> Result<()> {
 fn macos_plist_path() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|directories| directories.home_dir().to_path_buf())
-        .context("could not determine the current user home directory")?;
+        .context("无法确定当前用户主目录")?;
     Ok(home
         .join("Library")
         .join("LaunchAgents")
@@ -242,16 +241,13 @@ fn current_uid() -> Result<String> {
     let output = Command::new("/usr/bin/id")
         .arg("-u")
         .output()
-        .context("could not determine the current user ID")?;
+        .context("无法确定当前用户 ID")?;
     if !output.status.success() {
-        bail!(
-            "could not determine the current user ID ({})",
-            output.status
-        );
+        bail!("无法确定当前用户 ID（{}）", output.status);
     }
     let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if uid.is_empty() {
-        bail!("could not determine the current user ID");
+        bail!("无法确定当前用户 ID");
     }
     Ok(uid)
 }
@@ -270,12 +266,12 @@ fn install_linux_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", unit_path.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", unit_path.display()));
         }
     };
     if previous.is_some() && !is_managed_linux_unit(&unit_path) {
         bail!(
-            "refusing to overwrite user-managed systemd unit {}",
+            "{} 是用户自行管理的 systemd 服务，为保护现有配置，codex-notify 不会覆盖它",
             unit_path.display()
         );
     }
@@ -299,7 +295,7 @@ fn install_linux_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(error)
-                            .with_context(|| format!("could not remove {}", unit_path.display()));
+                            .with_context(|| format!("无法删除 {}", unit_path.display()));
                     }
                 },
             }
@@ -313,9 +309,7 @@ fn install_linux_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
             Ok(())
         })();
         if let Err(rollback_error) = rollback_result {
-            bail!(
-                "{install_error:#}; restoring the previous codex-notify watcher also failed: {rollback_error:#}"
-            );
+            bail!("{install_error:#}；恢复原有 codex-notify 后台监听也失败了：{rollback_error:#}");
         }
         return Err(install_error);
     }
@@ -330,14 +324,13 @@ fn uninstall_linux_watcher() -> Result<()> {
     }
     if !is_managed_linux_unit(&unit_path) {
         bail!(
-            "refusing to remove user-managed systemd unit {}",
+            "{} 是用户自行管理的 systemd 服务，为保护现有配置，codex-notify 不会删除它",
             unit_path.display()
         );
     }
 
     run_user_systemctl(&["disable", "--now", LINUX_UNIT_NAME])?;
-    fs::remove_file(&unit_path)
-        .with_context(|| format!("could not remove {}", unit_path.display()))?;
+    fs::remove_file(&unit_path).with_context(|| format!("无法删除 {}", unit_path.display()))?;
     run_user_systemctl(&["daemon-reload"])?;
     Ok(())
 }
@@ -350,7 +343,7 @@ fn stop_linux_watcher() -> Result<()> {
     }
     if !is_managed_linux_unit(&unit_path) {
         bail!(
-            "refusing to stop user-managed systemd unit {}",
+            "{} 是用户自行管理的 systemd 服务，codex-notify 不会停止它",
             unit_path.display()
         );
     }
@@ -363,11 +356,14 @@ fn run_user_systemctl(arguments: &[&str]) -> Result<()> {
         .arg("--user")
         .args(arguments)
         .status()
-        .context("could not run systemctl --user")?;
+        .context("无法运行 systemctl --user")?;
     if status.success() {
         return Ok(());
     }
-    bail!("systemctl --user {} failed ({status})", arguments.join(" "))
+    bail!(
+        "systemctl --user {} 执行失败（{status}）",
+        arguments.join(" ")
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -375,12 +371,12 @@ fn ensure_linux_watcher_active() -> Result<()> {
     let status = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", LINUX_UNIT_NAME])
         .status()
-        .context("could not verify the codex-notify systemd user service")?;
+        .context("无法检查 codex-notify systemd 用户服务")?;
     if status.success() {
         return Ok(());
     }
     bail!(
-        "the codex-notify systemd user service did not stay active; run 'systemctl --user status {LINUX_UNIT_NAME}' for details"
+        "codex-notify systemd 用户服务未保持运行，请执行 systemctl --user status {LINUX_UNIT_NAME} 查看详情"
     )
 }
 
@@ -388,7 +384,7 @@ fn ensure_linux_watcher_active() -> Result<()> {
 fn linux_unit_path() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|directories| directories.home_dir().to_path_buf())
-        .context("could not determine the current user home directory")?;
+        .context("无法确定当前用户主目录")?;
     Ok(home
         .join(".config")
         .join("systemd")
@@ -408,18 +404,20 @@ fn install_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     if let Some(existing) = read_windows_run_command()?
         && !is_managed_windows_run_command(&existing)
     {
-        bail!("refusing to overwrite user-managed Windows startup entry {WINDOWS_RUN_VALUE}");
+        bail!(
+            "Windows 启动项 {WINDOWS_RUN_VALUE} 由用户自行管理，为保护现有配置，codex-notify 不会覆盖它"
+        );
     }
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     let (run_key, _) = current_user
         .create_subkey(WINDOWS_RUN_KEY)
-        .context("could not open the current user's Windows startup registry key")?;
+        .context("无法打开当前用户的 Windows 启动项注册表")?;
     run_key
         .set_value(
             WINDOWS_RUN_VALUE,
             &windows_run_command(binary, &paths.root, &paths.codex_home),
         )
-        .context("could not install the codex-notify Windows startup entry")?;
+        .context("无法安装 codex-notify Windows 启动项")?;
 
     start_windows_watcher(paths, binary)
 }
@@ -442,16 +440,16 @@ fn start_windows_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
         .stderr(Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
-        .with_context(|| format!("could not start watcher {}", binary.display()))?;
+        .with_context(|| format!("无法启动后台监听 {}", binary.display()))?;
     std::thread::sleep(std::time::Duration::from_millis(250));
     if let Some(status) = child
         .try_wait()
-        .context("could not verify the codex-notify Windows watcher")?
+        .context("无法检查 codex-notify Windows 后台监听")?
     {
         if windows_watcher_running(paths)? {
             return Ok(());
         }
-        bail!("the codex-notify Windows watcher exited immediately ({status})");
+        bail!("codex-notify Windows 后台监听启动后立即退出（{status}）");
     }
     Ok(())
 }
@@ -465,7 +463,7 @@ fn windows_watcher_running(paths: &AppPaths) -> Result<bool> {
         .write(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+        .with_context(|| format!("无法打开 {}", path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => {
             let _ = FileExt::unlock(&file);
@@ -474,7 +472,7 @@ fn windows_watcher_running(paths: &AppPaths) -> Result<bool> {
         Err(error) if error.kind() == ErrorKind::WouldBlock || error.raw_os_error() == Some(33) => {
             Ok(true)
         }
-        Err(error) => Err(error).with_context(|| format!("could not lock {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法锁定 {}", path.display())),
     }
 }
 
@@ -484,15 +482,17 @@ fn uninstall_windows_watcher() -> Result<()> {
         return Ok(());
     };
     if !is_managed_windows_run_command(&existing) {
-        bail!("refusing to remove user-managed Windows startup entry {WINDOWS_RUN_VALUE}");
+        bail!(
+            "Windows 启动项 {WINDOWS_RUN_VALUE} 由用户自行管理，为保护现有配置，codex-notify 不会删除它"
+        );
     }
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = current_user
         .open_subkey_with_flags(WINDOWS_RUN_KEY, KEY_READ | KEY_WRITE)
-        .context("could not open the current user's Windows startup registry key")?;
+        .context("无法打开当前用户的 Windows 启动项注册表")?;
     run_key
         .delete_value(WINDOWS_RUN_VALUE)
-        .context("could not remove the codex-notify Windows startup entry")
+        .context("无法删除 codex-notify Windows 启动项")
 }
 
 #[cfg(target_os = "windows")]
@@ -502,14 +502,13 @@ fn read_windows_run_command() -> Result<Option<String>> {
         Ok(key) => key,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error)
-                .context("could not open the current user's Windows startup registry key");
+            return Err(error).context("无法打开当前用户的 Windows 启动项注册表");
         }
     };
     match run_key.get_value(WINDOWS_RUN_VALUE) {
         Ok(command) => Ok(Some(command)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("could not read the codex-notify Windows startup entry"),
+        Err(error) => Err(error).context("无法读取 codex-notify Windows 启动项"),
     }
 }
 
@@ -579,7 +578,7 @@ fn systemd_path_value(value: &str) -> Result<String> {
         .chars()
         .any(|character| matches!(character, '\n' | '\r' | '\0'))
     {
-        bail!("systemd service values must not contain control characters");
+        bail!("systemd 服务配置值不能包含控制字符");
     }
     Ok(value
         .replace('\\', "\\\\")
@@ -594,7 +593,7 @@ fn systemd_quote(value: &str) -> Result<String> {
         .chars()
         .any(|character| matches!(character, '\n' | '\r' | '\0'))
     {
-        bail!("systemd service values must not contain control characters");
+        bail!("systemd 服务配置值不能包含控制字符");
     }
     let escaped = value
         .replace('\\', "\\\\")

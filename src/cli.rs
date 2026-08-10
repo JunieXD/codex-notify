@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
-use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use clap::error::{ContextKind, ErrorKind};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
@@ -32,11 +33,7 @@ use crate::updater::{
 };
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "codex-notify",
-    version,
-    about = "Local Feishu notifications for Codex."
-)]
+#[command(name = "codex-notify", version, about = "为 Codex 提供本地飞书通知。")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -44,31 +41,31 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Configure Feishu and reversible Codex integration.
+    /// 配置飞书通知并安全接入 Codex。
     Init(InitArgs),
-    /// Send a Feishu test card using the current configuration.
+    /// 使用当前配置发送一条飞书测试通知。
     Test,
-    /// Show local installation status without revealing secrets.
+    /// 查看本机配置和运行状态，不会显示密钥。
     Status(JsonOutput),
-    /// Diagnose the local Codex and Feishu configuration.
+    /// 检查 Codex 与飞书配置并给出处理建议。
     Doctor(JsonOutput),
-    /// Reapply the integration after another tool switches config.toml.
+    /// 在其他工具切换 config.toml 后重新接入通知。
     Sync,
-    /// Check for updates or safely install a newer release.
+    /// 检查更新或安全升级到新版本。
     Update(UpdateArgs),
-    /// Restore the previous Codex notifier and remove codex-notify integration.
+    /// 恢复原有 Codex 通知命令并移除 codex-notify。
     Uninstall(UninstallArgs),
-    /// Run the local terminal-error watcher.
+    /// 运行本地任务异常监听器。
     Watch(WatchArgs),
     #[command(hide = true)]
     Notify {
-        /// Marks the self-contained notify command written by codex-notify.
+        /// 标记由 codex-notify 写入的独立通知命令。
         #[arg(long)]
         managed: bool,
-        /// JSON command invoked before the Feishu notification.
+        /// 发送飞书通知前调用的 JSON 命令。
         #[arg(long)]
         forward_notify: Option<String>,
-        /// The single JSON argument supplied by Codex notify.
+        /// Codex notify 传入的单个 JSON 参数。
         event_json: String,
     },
     #[command(name = "prompt-hook", hide = true)]
@@ -83,71 +80,76 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct InitArgs {
-    /// Feishu App ID. Prompts when omitted.
-    #[arg(long)]
+    /// 飞书 App ID；未提供时会交互询问。
+    #[arg(long, value_name = "APP_ID")]
     app_id: Option<String>,
-    /// Feishu App Secret. Passing this in a shell can expose it in history.
-    #[arg(long)]
+    /// 飞书 App Secret；直接写在命令中可能被终端历史记录保存。
+    #[arg(long, value_name = "APP_SECRET")]
     app_secret: Option<String>,
-    /// Feishu receiver identifier type.
-    #[arg(long, value_enum)]
+    /// 飞书接收者 ID 类型：open_id、user_id、email 或 chat_id。
+    #[arg(long, value_enum, hide_possible_values = true, value_name = "接收类型")]
     receiver_id_type: Option<ReceiverIdType>,
-    /// Feishu receiver identifier.
-    #[arg(long)]
+    /// 飞书接收者 ID。
+    #[arg(long, value_name = "接收者_ID")]
     receiver_id: Option<String>,
-    /// Binary path that Codex should invoke. Defaults to the running executable.
-    #[arg(long)]
+    /// 供 Codex 调用的程序路径；默认使用当前程序。
+    #[arg(long, value_name = "程序路径")]
     binary: Option<PathBuf>,
-    /// Do not prompt for confirmation.
+    /// 跳过确认提示。
     #[arg(short, long)]
     yes: bool,
-    /// Do not send a test Feishu card after installation.
+    /// 配置完成后不发送飞书测试通知。
     #[arg(long)]
     skip_test: bool,
 }
 
 #[derive(Debug, Args)]
 struct JsonOutput {
-    /// Print machine-readable JSON.
+    /// 输出便于程序读取的 JSON。
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct UninstallArgs {
-    /// Do not prompt for confirmation.
+    /// 跳过确认提示。
     #[arg(short, long)]
     yes: bool,
 }
 
 #[derive(Debug, Args)]
 struct WatchArgs {
-    /// Scan once and exit instead of running the background loop.
+    /// 只检查一次并退出，不持续后台运行。
     #[arg(long)]
     once: bool,
 }
 
 #[derive(Debug, Args)]
 struct UpdateArgs {
-    /// Only report whether an update is available.
+    /// 只检查是否有新版本，不执行升级。
     #[arg(long)]
     check: bool,
-    /// Install a specific version, such as v0.4.0.
-    #[arg(long)]
+    /// 安装指定版本，例如 v0.4.0。
+    #[arg(long, value_name = "版本")]
     version: Option<String>,
-    /// GitHub repository to download releases from.
-    #[arg(long, default_value = DEFAULT_REPOSITORY)]
+    /// 下载发行版的 GitHub 仓库；默认使用 JunieXD/codex-notify。
+    #[arg(
+        long,
+        default_value = DEFAULT_REPOSITORY,
+        hide_default_value = true,
+        value_name = "仓库"
+    )]
     repository: String,
-    /// Reinstall the same version or explicitly allow a downgrade.
+    /// 允许重新安装当前版本或降级。
     #[arg(long)]
     force: bool,
-    /// Do not prompt for confirmation.
+    /// 跳过确认提示。
     #[arg(short, long)]
     yes: bool,
-    /// Override the release download directory for end-to-end tests.
+    /// 为端到端测试指定发行版下载目录。
     #[arg(long, hide = true)]
     download_base: Option<String>,
-    /// Simulate a post-replacement failure for rollback tests.
+    /// 为回滚测试模拟替换后的失败。
     #[arg(long, hide = true)]
     fail_finalize_for_test: bool,
 }
@@ -180,6 +182,9 @@ const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHER_LOCK_FILENAME: &str = "watcher-process.lock";
 const WATCHER_STOP_FILENAME: &str = "watcher.stop";
 const UPDATE_LOCK_FILENAME: &str = ".codex-notify-update.lock";
+const ROOT_HELP_TEMPLATE: &str = "{before-help}{about-with-newline}\n用法：{usage}\n\n命令：\n{subcommands}\n选项：\n{options}{after-help}";
+const COMMAND_HELP_TEMPLATE: &str =
+    "{before-help}{about-with-newline}\n用法：{usage}\n\n选项：\n{options}{after-help}";
 const HOOK_TRUST_GUIDANCE: &str = "还差一步：信任两个用户 Hook\n\
 如果你使用 ChatGPT App（原 Codex App）：\n\
   1. 打开“设置”，进入“钩子”。\n\
@@ -187,7 +192,7 @@ const HOOK_TRUST_GUIDANCE: &str = "还差一步：信任两个用户 Hook\n\
 如果你使用 Codex CLI：运行 /hooks，然后信任这两个 Hook。";
 
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let result = match cli.command {
         Commands::Init(arguments) => init(arguments),
         Commands::Test => send_test(),
@@ -211,15 +216,141 @@ pub fn run() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("codex-notify: {error:#}");
+            eprintln!("codex-notify：操作失败：{error:#}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn parse_cli() -> Cli {
+    let command = localized_cli_command();
+    let matches = match command.try_get_matches() {
+        Ok(matches) => matches,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(error) => exit_with_localized_argument_error(&error),
+    };
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+fn localized_cli_command() -> clap::Command {
+    let mut command = Cli::command();
+    localize_help(&mut command, true);
+    command
+}
+
+fn exit_with_localized_argument_error(error: &clap::Error) -> ! {
+    let invalid_subcommand = argument_error_value(error, ContextKind::InvalidSubcommand);
+    let invalid_argument = argument_error_value(error, ContextKind::InvalidArg);
+    let invalid_value = argument_error_value(error, ContextKind::InvalidValue);
+    let message = match error.kind() {
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            if let Some(value) = invalid_subcommand {
+                format!("无法识别命令“{value}”")
+            } else if let Some(value) = invalid_argument {
+                format!("无法识别参数“{value}”")
+            } else {
+                "包含无法识别的命令或参数".to_owned()
+            }
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => match invalid_value {
+            Some(value) => format!("“{value}”不是有效值"),
+            None => "参数值无效".to_owned(),
+        },
+        ErrorKind::NoEquals => "这个选项需要使用“=”连接参数值".to_owned(),
+        ErrorKind::TooManyValues => "提供的参数值过多".to_owned(),
+        ErrorKind::TooFewValues => "提供的参数值不足".to_owned(),
+        ErrorKind::WrongNumberOfValues => "参数值数量不正确".to_owned(),
+        ErrorKind::ArgumentConflict => "部分参数不能同时使用".to_owned(),
+        ErrorKind::MissingRequiredArgument => "缺少必填参数".to_owned(),
+        ErrorKind::MissingSubcommand => "缺少要执行的命令".to_owned(),
+        ErrorKind::Io | ErrorKind::Format => "无法读取命令行参数".to_owned(),
+        _ => "命令行参数有误".to_owned(),
+    };
+
+    eprintln!("codex-notify：{message}。");
+    if let Some(suggestion) = [
+        ContextKind::SuggestedSubcommand,
+        ContextKind::SuggestedArg,
+        ContextKind::SuggestedValue,
+        ContextKind::SuggestedCommand,
+    ]
+    .into_iter()
+    .find_map(|kind| argument_error_value(error, kind))
+    {
+        eprintln!("你可能想输入：{suggestion}");
+    }
+    if let Some(values) = argument_error_value(error, ContextKind::ValidValue) {
+        eprintln!("可选值：{}", values.replace(", ", "、"));
+    }
+    eprintln!("请运行 codex-notify --help 查看完整帮助。");
+    std::process::exit(error.exit_code());
+}
+
+fn argument_error_value(error: &clap::Error, kind: ContextKind) -> Option<String> {
+    error
+        .get(kind)
+        .map(ToString::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn localize_help(command: &mut clap::Command, root: bool) {
+    *command = command.clone().disable_help_subcommand(true);
+    command.build();
+    let template = if root {
+        ROOT_HELP_TEMPLATE
+    } else {
+        COMMAND_HELP_TEMPLATE
+    };
+    let has_help = command
+        .get_arguments()
+        .any(|argument| matches!(argument.get_action(), clap::ArgAction::Help));
+    let has_version = command
+        .get_arguments()
+        .any(|argument| matches!(argument.get_action(), clap::ArgAction::Version));
+    let mut localized = command.clone().help_template(template);
+    if let Some(usage) = localized_usage(command.get_name()) {
+        localized = localized.override_usage(usage);
+    }
+    if has_help {
+        localized = localized.mut_arg("help", |argument| argument.help("显示帮助信息"));
+    }
+    if has_version {
+        localized = localized.mut_arg("version", |argument| argument.help("显示版本信息"));
+    }
+    *command = localized;
+    for subcommand in command.get_subcommands_mut() {
+        localize_help(subcommand, false);
+    }
+}
+
+fn localized_usage(command_name: &str) -> Option<&'static str> {
+    match command_name {
+        "codex-notify" => Some("codex-notify <命令>"),
+        "init" => Some("codex-notify init [选项]"),
+        "test" => Some("codex-notify test"),
+        "status" => Some("codex-notify status [选项]"),
+        "doctor" => Some("codex-notify doctor [选项]"),
+        "sync" => Some("codex-notify sync"),
+        "update" => Some("codex-notify update [选项]"),
+        "uninstall" => Some("codex-notify uninstall [选项]"),
+        "watch" => Some("codex-notify watch [选项]"),
+        _ => None,
     }
 }
 
 fn init(arguments: InitArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let existing = AppConfig::load(&paths)?;
+    let reconfiguring = existing.is_some();
     let original_app_config = read_optional_file(&paths.config)?;
     let theme = ColorfulTheme::default();
     let interactive = arguments.app_id.is_none()
@@ -227,7 +358,23 @@ fn init(arguments: InitArgs) -> Result<()> {
         || arguments.receiver_id_type.is_none()
         || arguments.receiver_id.is_none();
     if interactive {
-        print_init_intro();
+        if let Some(config) = existing.as_ref() {
+            print_existing_configuration(&paths, config);
+            if !arguments.yes
+                && !choose_action(
+                    &theme,
+                    "请选择接下来的操作",
+                    "重新配置",
+                    "保留当前配置",
+                    false,
+                )?
+            {
+                println!("已保留当前配置，没有修改任何内容。");
+                println!("如需检查运行状态，请执行 codex-notify doctor。");
+                return Ok(());
+            }
+        }
+        print_init_intro(reconfiguring);
     }
     if arguments.app_id.is_none() {
         print_app_id_help();
@@ -278,19 +425,29 @@ fn init(arguments: InitArgs) -> Result<()> {
     println!("  - Codex Hook 配置：{}", paths.codex_hooks().display());
     println!("  - codex-notify 配置：{}", paths.config.display());
     println!("  - 后台监听：{}", platform::watcher_location()?);
-    println!("现有 notify 命令和 Hook 会保留；修改前会自动创建备份。");
+    if reconfiguring {
+        println!("当前飞书设置和 App Secret 会被新内容替换。");
+    }
+    println!("现有 notify 命令和其他 Hook 会保留；相关配置修改前会自动备份。");
     if !arguments.yes
-        && !Confirm::with_theme(&theme)
-            .with_prompt("确认写入配置并启动后台监听吗？")
-            .default(true)
-            .interact()
-            .context("无法读取确认结果")?
+        && !choose_action(
+            &theme,
+            "请选择接下来的操作",
+            "写入配置并启动监听",
+            "取消，不做修改",
+            true,
+        )?
     {
         println!("已取消，没有修改任何配置。");
         return Ok(());
     }
 
     let binary = resolve_binary(arguments.binary)?;
+    let app_config_backup = if reconfiguring {
+        backup_file(&paths, &paths.config, "codex-notify-config")?
+    } else {
+        None
+    };
     let feishu = FeishuConfig {
         app_id,
         receiver_id_type,
@@ -345,9 +502,16 @@ fn init(arguments: InitArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|command| looks_like_feishu_notifier(command))
     {
-        eprintln!("提示：保留的旧 notifier 似乎也会发送飞书消息，停用旧通知前可能收到重复提醒。");
+        eprintln!("提示：保留的原有通知程序似乎也会发送飞书消息，停用它之前可能收到重复提醒。");
     }
-    println!("\n配置完成，codex-notify 已接入 Codex。");
+    if reconfiguring {
+        println!("\n重新配置完成，codex-notify 已更新并重新接入 Codex。");
+    } else {
+        println!("\n配置完成，codex-notify 已接入 Codex。");
+    }
+    if let Some(path) = app_config_backup {
+        println!("原 codex-notify 配置备份：{}", path.display());
+    }
     if let Some(path) = setup.config_backup {
         println!("Codex 配置备份：{}", path.display());
     }
@@ -358,11 +522,13 @@ fn init(arguments: InitArgs) -> Result<()> {
 
     let should_test = !arguments.skip_test
         && (arguments.yes
-            || Confirm::with_theme(&theme)
-                .with_prompt("现在发送一条飞书测试通知吗？")
-                .default(true)
-                .interact()
-                .context("无法读取测试通知确认结果")?);
+            || choose_action(
+                &theme,
+                "是否发送一条飞书测试通知？",
+                "发送测试通知",
+                "暂不测试",
+                true,
+            )?);
     if should_test {
         match send_test_for(&config) {
             Ok(()) => println!("飞书测试通知已发送。"),
@@ -380,16 +546,16 @@ fn send_test() -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = configured(&paths)?;
     send_test_for(&config)?;
-    println!("Feishu test card sent.");
+    println!("飞书测试通知已发送，请检查接收端。");
     Ok(())
 }
 
 fn send_test_for(config: &AppConfig) -> Result<()> {
     let secret = KeyringSecretStore.get_feishu_secret(&config.feishu)?;
     let notification = Notification::completed(
-        "Codex notification test",
-        "Send a Feishu test notification",
-        "The Feishu provider, credential store, and card renderer are working.",
+        "codex-notify 测试通知",
+        "检查飞书通知是否可以正常送达",
+        "飞书连接、系统凭据和通知卡片均工作正常。",
         Some(Duration::from_secs(2)),
         "test-notification",
     );
@@ -419,16 +585,16 @@ fn sync() -> Result<()> {
     let result = reconcile_active_config(&paths, &mut config)?;
     if result.changed {
         println!(
-            "Codex notify integration was synchronized ({}).",
-            result.placement.as_str()
+            "Codex 通知接入已同步（{}）。",
+            notify_placement_name(result.placement.as_str())
         );
         if let Some(path) = result.config_backup {
-            println!("Config backup: {}", path.display());
+            println!("配置备份：{}", path.display());
         }
     } else {
         println!(
-            "Codex notify integration is already synchronized ({}).",
-            result.placement.as_str()
+            "Codex 通知接入已经是最新状态（{}），无需修改。",
+            notify_placement_name(result.placement.as_str())
         );
     }
     Ok(())
@@ -436,8 +602,8 @@ fn sync() -> Result<()> {
 
 fn update(arguments: UpdateArgs) -> Result<()> {
     let current = updater::current_version()?;
-    println!("Installed version: v{current}");
-    println!("Checking for updates...");
+    println!("当前版本：v{current}");
+    println!("正在检查更新……");
     let release = updater::resolve_release(
         &arguments.repository,
         arguments.version.as_deref(),
@@ -446,21 +612,24 @@ fn update(arguments: UpdateArgs) -> Result<()> {
     let needed = updater::update_needed(&current, &release.version, arguments.force)?;
 
     if !needed {
-        println!("codex-notify is already up to date (v{current}).");
+        println!("你已经在使用最新版（v{current}）。");
         return Ok(());
     }
     if arguments.check {
-        println!("Update available: v{current} -> {}", release.tag);
+        println!("发现新版本：v{current} → {}", release.tag);
         return Ok(());
     }
+    let theme = ColorfulTheme::default();
     if !arguments.yes
-        && !Confirm::new()
-            .with_prompt(format!("Install {}?", release.tag))
-            .default(true)
-            .interact()
-            .context("could not read update confirmation")?
+        && !choose_action(
+            &theme,
+            &format!("发现 {}，请选择接下来的操作", release.tag),
+            "立即升级",
+            "暂不升级",
+            true,
+        )?
     {
-        println!("Canceled without changing the installed version.");
+        println!("已取消，当前版本没有变化。");
         return Ok(());
     }
 
@@ -469,8 +638,8 @@ fn update(arguments: UpdateArgs) -> Result<()> {
     let _update_lease = acquire_update_lease(&current_executable)?;
     let staging_parent = current_executable
         .parent()
-        .context("the installed executable does not have a parent directory")?;
-    println!("Downloading and verifying {}...", release.tag);
+        .context("无法确定当前程序所在目录")?;
+    println!("正在下载并校验 {}……", release.tag);
     let prepared = updater::prepare_release(release, staging_parent)?;
     let target_tag = prepared.info.tag.clone();
     apply_self_update(
@@ -479,7 +648,7 @@ fn update(arguments: UpdateArgs) -> Result<()> {
         prepared,
         arguments.fail_finalize_for_test,
     )?;
-    println!("Updated codex-notify from v{current} to {target_tag}.");
+    println!("升级完成：v{current} → {target_tag}。");
     Ok(())
 }
 
@@ -516,8 +685,8 @@ fn apply_self_update(
     let finalize_result =
         run_update_finalize(current_executable, restart_watcher, fail_finalize_for_test);
     if let Err(finalize_error) = finalize_result {
-        let executable_recovery = install_executable(backup.path(), current_executable)
-            .context("could not restore the previous executable");
+        let executable_recovery =
+            install_executable(backup.path(), current_executable).context("无法恢复升级前的程序");
         let watcher_recovery =
             resume_watcher_after_update(paths, current_executable, restart_watcher);
         let recovery = combine_recovery_steps(executable_recovery, watcher_recovery);
@@ -532,13 +701,13 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
     if let Some(expected) = arguments.expected_version.as_deref() {
         let expected = updater::parse_version(expected)?;
         if expected != source_version {
-            bail!("the downloaded executable is v{source_version}, but v{expected} was requested");
+            bail!("下载的程序版本是 v{source_version}，但请求安装的是 v{expected}");
         }
     }
 
     let target = absolute_path(&arguments.target)?;
     if source == target {
-        bail!("the prepared executable and installation target are the same file");
+        bail!("待安装程序与目标位置是同一个文件，无法继续");
     }
     let installed_version = target
         .exists()
@@ -547,25 +716,21 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
     match installed_version.as_ref() {
         Ok(Some(installed)) => {
             if !updater::update_needed(installed, &source_version, arguments.force)? {
-                println!("codex-notify is already up to date (v{installed}).");
+                println!("你已经在使用最新版（v{installed}）。");
                 return Ok(());
             }
-            println!("Upgrading codex-notify from v{installed} to v{source_version}...");
+            println!("正在升级 codex-notify：v{installed} → v{source_version}……");
         }
-        Ok(None) => println!("Installing codex-notify v{source_version}..."),
+        Ok(None) => println!("正在安装 codex-notify v{source_version}……"),
         Err(error) => {
-            eprintln!(
-                "Warning: the existing executable could not report its version; it will be repaired: {error:#}"
-            );
+            eprintln!("提示：现有程序无法报告版本，将尝试修复安装：{error:#}");
         }
     }
 
     let paths = AppPaths::discover()?;
-    let target_parent = target
-        .parent()
-        .context("the installation target does not have a parent directory")?;
+    let target_parent = target.parent().context("无法确定安装目标所在目录")?;
     fs::create_dir_all(target_parent)
-        .with_context(|| format!("could not create {}", target_parent.display()))?;
+        .with_context(|| format!("无法创建目录 {}", target_parent.display()))?;
     let _update_lease = acquire_update_lease(&target)?;
     let existing_config = AppConfig::load(&paths)?;
     // A watcher launcher is user-global on every supported platform. It may
@@ -582,20 +747,14 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
     let backup_directory = tempfile::Builder::new()
         .prefix("codex-notify-installer-backup-")
         .tempdir_in(target_parent)
-        .with_context(|| {
-            format!(
-                "could not create an installer rollback directory in {}",
-                target_parent.display()
-            )
-        })?;
+        .with_context(|| format!("无法在 {} 中创建安装回滚目录", target_parent.display()))?;
     let backup = target.exists().then(|| {
         let path = backup_directory.path().join(if cfg!(windows) {
             "codex-notify.previous.exe"
         } else {
             "codex-notify.previous"
         });
-        fs::copy(&target, &path)
-            .with_context(|| format!("could not back up {}", target.display()))?;
+        fs::copy(&target, &path).with_context(|| format!("无法备份 {}", target.display()))?;
         Ok::<_, anyhow::Error>(path)
     });
     let backup = backup.transpose()?;
@@ -621,7 +780,7 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
         if installed == source_version {
             Ok(())
         } else {
-            bail!("the installed executable reported v{installed}, expected v{source_version}")
+            bail!("安装后的程序报告版本 v{installed}，预期应为 v{source_version}")
         }
     }) {
         let recovery = restore_installer_update(
@@ -649,9 +808,9 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
             );
             return Err(with_recovery(error, recovery));
         }
-        println!("codex-notify was upgraded safely to v{source_version}.");
+        println!("codex-notify 已安全升级到 v{source_version}。");
     } else {
-        println!("Installed codex-notify to {}", target.display());
+        println!("codex-notify 已安装到 {}", target.display());
     }
     Ok(())
 }
@@ -665,11 +824,8 @@ fn restore_installer_update(
     coordinated_upgrade: bool,
 ) -> Result<()> {
     let executable_recovery = match backup {
-        Some(backup) => {
-            install_executable(backup, target).context("could not restore the previous executable")
-        }
-        None => remove_executable(target)
-            .with_context(|| format!("could not remove {}", target.display())),
+        Some(backup) => install_executable(backup, target).context("无法恢复安装前的程序"),
+        None => remove_executable(target).with_context(|| format!("无法删除 {}", target.display())),
     };
     let watcher_recovery = if coordinated_upgrade {
         resume_watcher_after_update(paths, previous_binary, restart_watcher)
@@ -681,15 +837,11 @@ fn restore_installer_update(
 
 fn update_finalize(arguments: UpdateFinalizeArgs) -> Result<()> {
     if arguments.fail_for_test {
-        bail!("simulated update finalization failure");
+        bail!("模拟升级收尾失败");
     }
     let paths = AppPaths::discover()?;
-    let binary = fs::canonicalize(&arguments.binary).with_context(|| {
-        format!(
-            "could not resolve installed executable {}",
-            arguments.binary.display()
-        )
-    })?;
+    let binary = fs::canonicalize(&arguments.binary)
+        .with_context(|| format!("无法解析已安装程序路径 {}", arguments.binary.display()))?;
     refresh_existing_installation(&paths, &binary, arguments.restart_watcher)
 }
 
@@ -742,16 +894,13 @@ fn run_update_finalize(
     if fail_for_test {
         command.arg("--fail-for-test");
     }
-    let status = command.status().with_context(|| {
-        format!(
-            "could not start the updated executable {}",
-            executable.display()
-        )
-    })?;
+    let status = command
+        .status()
+        .with_context(|| format!("无法启动升级后的程序 {}", executable.display()))?;
     if status.success() {
         return Ok(());
     }
-    bail!("the updated executable could not finalize the upgrade ({status})")
+    bail!("升级后的程序未能完成收尾操作（{status}）")
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -759,16 +908,16 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     Ok(std::env::current_dir()
-        .context("could not determine the current directory")?
+        .context("无法确定当前目录")?
         .join(path))
 }
 
 fn with_recovery(error: anyhow::Error, recovery: Result<()>) -> anyhow::Error {
     match recovery {
         Ok(()) => error,
-        Err(recovery_error) => anyhow::anyhow!(
-            "{error:#}; restoring the previous installation also failed: {recovery_error:#}"
-        ),
+        Err(recovery_error) => {
+            anyhow::anyhow!("{error:#}；恢复升级前的安装也失败了：{recovery_error:#}")
+        }
     }
 }
 
@@ -777,7 +926,7 @@ fn combine_recovery_steps(first: Result<()>, second: Result<()>) -> Result<()> {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(first), Err(second)) => {
-            bail!("{first:#}; restoring the watcher also failed: {second:#}")
+            bail!("{first:#}；恢复后台监听也失败了：{second:#}")
         }
     }
 }
@@ -825,7 +974,7 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(data).expect("inspection must be serializable")
+            serde_json::to_string_pretty(data).expect("状态检查结果应当可以序列化")
         );
         return;
     }
@@ -839,45 +988,73 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     let watcher = data["background_watcher_installed"]
         .as_bool()
         .unwrap_or(false);
-    println!("Configured: {}", yes_no(configured));
-    println!("Credential store: {secret}");
+    println!("codex-notify 状态");
+    println!("-----------------");
+    println!("配置状态：{}", if configured { "已完成" } else { "未配置" });
+    println!("系统凭据：{}", credential_status_name(secret));
     println!(
-        "Codex notify dispatcher: {} ({notifier_mode})",
-        yes_no(notifier)
+        "Codex 通知接入：{}（{}）",
+        if notifier { "正常" } else { "未生效" },
+        notify_placement_name(notifier_mode)
     );
-    println!("UserPromptSubmit hook: {}", yes_no(hook));
-    println!("Stop hook: {}", yes_no(stop_hook));
-    println!("Background watcher: {}", yes_no(watcher));
-    if include_guidance && configured && !notifier {
+    println!("UserPromptSubmit Hook：{}", installed_status(hook));
+    println!("Stop Hook：{}", installed_status(stop_hook));
+    println!("后台监听：{}", installed_status(watcher));
+
+    if !include_guidance {
+        return;
+    }
+
+    println!("\n检查结果");
+    println!("--------");
+    let healthy = configured && secret == "present" && notifier && hook && stop_hook && watcher;
+    if healthy {
+        println!("基础配置正常。");
+    }
+    if !configured {
+        println!("建议：尚未完成配置，请运行 codex-notify init。");
+    } else if secret != "present" {
+        println!("建议：无法读取 App Secret，请重新运行 codex-notify init 保存凭据。");
+    }
+    if configured && !notifier {
         match notifier_mode {
             "detached" => {
-                println!("Notify repair: run codex-notify sync for the active config.toml.")
+                println!("建议：当前 config.toml 已切换，请运行 codex-notify sync 重新接入通知。");
             }
             "malformed" => println!(
-                "Notify repair: the active notify chain is malformed; inspect config.toml before retrying."
+                "建议：当前 notify 配置格式异常，请检查 config.toml 后再运行 codex-notify sync。"
             ),
             _ => {}
         }
     }
-    if include_guidance && hook {
-        println!("Hook trust: inspect and trust both hooks with /hooks in Codex.");
+    if configured && (!hook || !stop_hook) {
+        println!("建议：缺少必要的 Hook，请重新运行 codex-notify init 进行修复。");
+    }
+    if configured && !watcher {
+        println!("建议：后台监听尚未安装，请重新运行 codex-notify init 进行修复。");
+    }
+    if hook && stop_hook {
         println!(
-            "Error detection is best-effort because Codex transcripts are not a stable Hook API."
+            "Hook 信任：ChatGPT App 用户请前往“设置 → 钩子”，在“用户”区域信任这两个 Hook；Codex CLI 用户请运行 /hooks。"
         );
+        println!("说明：任务异常识别依赖 Codex 本地记录，会尽力判断，但可能无法覆盖所有异常情况。");
     }
 }
 
 fn uninstall(arguments: UninstallArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = configured(&paths)?;
+    let theme = ColorfulTheme::default();
     if !arguments.yes
-        && !Confirm::new()
-            .with_prompt("Restore the previous Codex notifier and remove codex-notify?")
-            .default(false)
-            .interact()
-            .context("could not read confirmation")?
+        && !choose_action(
+            &theme,
+            "卸载会恢复原有 Codex 通知命令，请选择",
+            "确认卸载",
+            "保留当前配置",
+            false,
+        )?
     {
-        println!("Canceled without changing configuration.");
+        println!("已取消，没有修改任何配置。");
         return Ok(());
     }
 
@@ -922,9 +1099,7 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
     if paths.state.exists() {
         remove_directory_tree(&paths.state)?;
     }
-    println!(
-        "codex-notify integration was removed; restored {restored_configs} managed Codex config file(s)."
-    );
+    println!("codex-notify 已移除，并恢复了 {restored_configs} 个由它管理的 Codex 配置文件。");
     Ok(())
 }
 
@@ -947,21 +1122,18 @@ fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> 
     if let Some(previous) = previous
         && run_previous_notifier(previous, &event_json).is_err()
     {
-        diagnostics::record(&paths, "previous Codex notifier failed");
+        diagnostics::record(&paths, "原有 Codex 通知命令执行失败");
     }
 
     let Some(config) = config else {
-        diagnostics::record(
-            &paths,
-            "notify skipped because codex-notify is not configured",
-        );
+        diagnostics::record(&paths, "codex-notify 尚未配置，已跳过本次通知");
         return Ok(());
     };
 
     let event: CompletionEvent = match serde_json::from_str(&event_json) {
         Ok(event) => event,
         Err(_) => {
-            diagnostics::record(&paths, "Codex notify received invalid event JSON");
+            diagnostics::record(&paths, "Codex notify 传入了无效的事件 JSON");
             return Ok(());
         }
     };
@@ -969,10 +1141,7 @@ fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> 
         return Ok(());
     }
     if monitor::mark_turn_completed(&paths, &event.turn_id).is_err() {
-        diagnostics::record(
-            &paths,
-            "could not cancel pending interruption after normal completion",
-        );
+        diagnostics::record(&paths, "任务正常完成后未能取消待发送的异常通知");
     }
 
     let result: Result<()> = (|| {
@@ -983,7 +1152,7 @@ fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> 
     })();
     let _ = remove_completion_state(&paths, &event);
     if result.is_err() {
-        diagnostics::record(&paths, "Feishu completion notification failed");
+        diagnostics::record(&paths, "飞书任务完成通知发送失败");
     }
     Ok(())
 }
@@ -993,14 +1162,14 @@ fn prompt_hook() -> Result<()> {
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
-        .context("could not read Codex Hook input")?;
+        .context("无法读取 Codex Hook 输入")?;
     match serde_json::from_str::<PromptHookEvent>(&input) {
         Ok(event) => {
             if record_prompt_context(&paths, &event).is_err() {
-                diagnostics::record(&paths, "could not record Codex task context");
+                diagnostics::record(&paths, "无法记录 Codex 任务上下文");
             }
         }
-        Err(_) => diagnostics::record(&paths, "Codex UserPromptSubmit Hook received invalid JSON"),
+        Err(_) => diagnostics::record(&paths, "Codex UserPromptSubmit Hook 收到了无效 JSON"),
     }
     println!("{{}}");
     Ok(())
@@ -1011,7 +1180,7 @@ fn stop_hook() -> Result<()> {
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
-        .context("could not read Codex Stop Hook input")?;
+        .context("无法读取 Codex Stop Hook 输入")?;
     match serde_json::from_str::<StopHookEvent>(&input) {
         Ok(event) if event.last_assistant_message.trim().is_empty() => {
             let transcript_path = (!event.transcript_path.trim().is_empty())
@@ -1026,11 +1195,11 @@ fn stop_hook() -> Result<()> {
             )
             .is_err()
             {
-                diagnostics::record(&paths, "could not record Codex Stop fallback");
+                diagnostics::record(&paths, "无法记录 Codex Stop 后备事件");
             }
         }
         Ok(_) => {}
-        Err(_) => diagnostics::record(&paths, "Codex Stop Hook received invalid JSON"),
+        Err(_) => diagnostics::record(&paths, "Codex Stop Hook 收到了无效 JSON"),
     }
     println!("{{}}");
     Ok(())
@@ -1057,24 +1226,17 @@ fn watch(arguments: WatchArgs) -> Result<()> {
             if arguments.once {
                 return Err(error);
             }
-            diagnostics::record(
-                &paths,
-                &format!("notify integration reconciliation failed: {error:#}"),
-            );
+            diagnostics::record(&paths, &format!("通知接入自动同步失败：{error:#}"));
         }
         if arguments.once || Instant::now() >= next_monitor_scan {
             match watch_once(&paths, &config) {
                 Ok(delivered) if arguments.once => {
-                    println!(
-                        "Watcher scan completed; delivered {delivered} interruption notification(s)."
-                    );
+                    println!("检查完成，本次发送了 {delivered} 条任务异常通知。");
                     return Ok(());
                 }
                 Ok(_) => {}
                 Err(error) if arguments.once => return Err(error),
-                Err(error) => {
-                    diagnostics::record(&paths, &format!("watcher scan failed: {error:#}"))
-                }
+                Err(error) => diagnostics::record(&paths, &format!("后台监听检查失败：{error:#}")),
             }
             next_monitor_scan = Instant::now() + monitor::WATCH_INTERVAL;
         }
@@ -1162,10 +1324,7 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
             }
             Err(error) => {
                 let _ = monitor::settle_delivery(paths, &delivery.key, false);
-                diagnostics::record(
-                    paths,
-                    &format!("Feishu interruption notification failed: {error:#}"),
-                );
+                diagnostics::record(paths, &format!("飞书任务异常通知发送失败：{error:#}"));
             }
         }
     }
@@ -1173,13 +1332,52 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
 }
 
 fn configured(paths: &AppPaths) -> Result<AppConfig> {
-    AppConfig::load(paths)?.context("codex-notify is not configured; run codex-notify init")
+    AppConfig::load(paths)?.context("codex-notify 尚未配置，请先运行 codex-notify init")
 }
 
-fn print_init_intro() {
-    println!("\ncodex-notify 飞书通知配置");
+fn choose_action(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    confirm_label: &str,
+    cancel_label: &str,
+    default_confirm: bool,
+) -> Result<bool> {
+    let options = [confirm_label, cancel_label];
+    let selection = Select::with_theme(theme)
+        .with_prompt(format!("{prompt}（↑/↓ 切换，回车确认）"))
+        .items(&options)
+        .default(if default_confirm { 0 } else { 1 })
+        .interact()
+        .context("无法读取选择结果")?;
+    Ok(selection == 0)
+}
+
+fn print_existing_configuration(paths: &AppPaths, config: &AppConfig) {
+    println!(
+        "\n{}",
+        existing_configuration_summary(paths, &config.feishu)
+    );
+}
+
+fn existing_configuration_summary(paths: &AppPaths, feishu: &FeishuConfig) -> String {
+    format!(
+        "检测到已有配置\n----------------\ncodex-notify 已经配置完成，无需重复初始化。\n  App ID：{}\n  接收方式：{}（{}）\n  接收者：{}\n  配置文件：{}\nApp Secret 已保存在系统凭据库中，这里不会显示。\n重新配置会替换以上飞书设置；Codex 原有通知命令和其他 Hook 不会被删除。",
+        feishu.app_id,
+        receiver_type_name(feishu.receiver_id_type),
+        feishu.receiver_id_type.as_api_value(),
+        feishu.receiver_id,
+        paths.config.display()
+    )
+}
+
+fn print_init_intro(reconfiguring: bool) {
+    if reconfiguring {
+        println!("\n重新配置 codex-notify 飞书通知");
+    } else {
+        println!("\ncodex-notify 飞书通知配置");
+    }
     println!("--------------------------");
-    println!("接下来会配置飞书应用凭证和通知接收者，完成确认前不会修改任何文件。");
+    println!("接下来会填写飞书应用凭证和通知接收者，完成最终确认前不会修改任何文件。");
     println!("请先打开飞书开放平台：https://open.feishu.cn/app");
     println!("选择企业自建应用后，可在“凭证与基础信息”中找到 App ID 和 App Secret。");
     println!("如果应用还没有机器人能力和消息权限，请先配置并发布应用。按 Ctrl+C 可随时退出。");
@@ -1291,7 +1489,7 @@ fn receiver_type_value(
     println!("如果不清楚各种 ID 的区别，选择“邮箱”最容易使用。");
     let options = receiver_type_options();
     let selection = Select::with_theme(theme)
-        .with_prompt("请选择接收方式（↑/↓ 切换，Enter 确认）")
+        .with_prompt("请选择接收方式（↑/↓ 切换，回车确认）")
         .items(&options)
         .default(receiver_type_index(
             default.unwrap_or(ReceiverIdType::Email),
@@ -1325,7 +1523,7 @@ fn receiver_type_from_index(index: usize) -> ReceiverIdType {
         1 => ReceiverIdType::OpenId,
         2 => ReceiverIdType::UserId,
         3 => ReceiverIdType::ChatId,
-        _ => unreachable!("receiver type selection is outside the available options"),
+        _ => unreachable!("接收方式选项超出可用范围"),
     }
 }
 
@@ -1399,10 +1597,9 @@ fn validate_receiver_id(
 fn resolve_binary(value: Option<PathBuf>) -> Result<PathBuf> {
     let path = match value {
         Some(path) => path,
-        None => std::env::current_exe().context("could not determine the running binary path")?,
+        None => std::env::current_exe().context("无法确定当前程序路径")?,
     };
-    fs::canonicalize(&path)
-        .with_context(|| format!("could not resolve binary path {}", path.display()))
+    fs::canonicalize(&path).with_context(|| format!("无法解析程序路径 {}", path.display()))
 }
 
 fn looks_like_feishu_notifier(command: &[String]) -> bool {
@@ -1414,15 +1611,35 @@ fn looks_like_feishu_notifier(command: &[String]) -> bool {
     })
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+fn installed_status(value: bool) -> &'static str {
+    if value { "已安装" } else { "未安装" }
+}
+
+fn credential_status_name(value: &str) -> &'static str {
+    match value {
+        "present" => "可用",
+        "unavailable" => "不可用",
+        "not_configured" => "未配置",
+        _ => "状态未知",
+    }
+}
+
+fn notify_placement_name(value: &str) -> &'static str {
+    match value {
+        "direct" => "直接接入",
+        "via_computer_use" => "通过 Computer Use 接入",
+        "detached" => "已与当前配置断开",
+        "malformed" => "配置格式异常",
+        "not_configured" => "尚未配置",
+        _ => "状态未知",
+    }
 }
 
 fn read_optional_file(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法读取 {}", path.display())),
     }
 }
 
@@ -1432,9 +1649,7 @@ fn restore_optional_file(path: &std::path::Path, contents: Option<&[u8]>) -> Res
         None => match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                Err(error).with_context(|| format!("could not remove {}", path.display()))
-            }
+            Err(error) => Err(error).with_context(|| format!("无法删除 {}", path.display())),
         },
     }
 }
@@ -1448,9 +1663,7 @@ fn watcher_stop_path(paths: &AppPaths) -> PathBuf {
 }
 
 fn update_lock_path(executable: &Path) -> Result<PathBuf> {
-    let parent = executable
-        .parent()
-        .context("the update target does not have a parent directory")?;
+    let parent = executable.parent().context("无法确定升级目标所在目录")?;
     Ok(parent.join(UPDATE_LOCK_FILENAME))
 }
 
@@ -1463,13 +1676,9 @@ fn acquire_watcher_lease(paths: &AppPaths) -> Result<File> {
         .write(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
-    file.try_lock_exclusive().with_context(|| {
-        format!(
-            "another codex-notify watcher is already using {}",
-            path.display()
-        )
-    })?;
+        .with_context(|| format!("无法打开 {}", path.display()))?;
+    file.try_lock_exclusive()
+        .with_context(|| format!("另一个 codex-notify 后台监听正在使用 {}", path.display()))?;
     Ok(file)
 }
 
@@ -1481,10 +1690,10 @@ fn acquire_update_lease(executable: &Path) -> Result<File> {
         .write(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+        .with_context(|| format!("无法打开 {}", path.display()))?;
     file.try_lock_exclusive().with_context(|| {
         format!(
-            "another codex-notify update is already running; wait for it to finish ({})",
+            "另一个 codex-notify 升级正在进行，请等待它完成（{}）",
             path.display()
         )
     })?;
@@ -1500,28 +1709,24 @@ fn clear_watcher_stop_request(paths: &AppPaths) -> Result<()> {
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法删除 {}", path.display())),
     }
 }
 
 fn request_watcher_stop(paths: &AppPaths) -> Result<()> {
     paths.ensure_directories()?;
     let path = watcher_stop_path(paths);
-    atomic_write(&path, b"stop\n").with_context(|| {
-        format!(
-            "could not request watcher shutdown through {}",
-            path.display()
-        )
-    })
+    atomic_write(&path, b"stop\n")
+        .with_context(|| format!("无法通过 {} 请求后台监听停止", path.display()))
 }
 
 fn stop_watcher_for_update(paths: &AppPaths) -> Result<()> {
     request_watcher_stop(paths)?;
     if let Err(error) = platform::stop_watcher(paths) {
         let _ = clear_watcher_stop_request(paths);
-        return Err(error).context("could not stop the background watcher for the update");
+        return Err(error).context("升级前无法停止后台监听");
     }
-    wait_for_watcher_exit(paths).context("could not stop the background watcher for the update")
+    wait_for_watcher_exit(paths).context("升级前无法停止后台监听")
 }
 
 fn resume_watcher_after_update(
@@ -1563,7 +1768,7 @@ fn wait_for_watcher_exit(paths: &AppPaths) -> Result<()> {
         .write(true)
         .truncate(false)
         .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+        .with_context(|| format!("无法打开 {}", path.display()))?;
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => {
@@ -1573,14 +1778,14 @@ fn wait_for_watcher_exit(paths: &AppPaths) -> Result<()> {
             Err(error) if is_lock_contended(&error) => {
                 if Instant::now() >= deadline {
                     bail!(
-                        "the background watcher did not stop within {} seconds; retry the operation",
+                        "后台监听在 {} 秒内未停止，请稍后重试",
                         WATCHER_SHUTDOWN_TIMEOUT.as_secs()
                     );
                 }
                 thread::sleep(WATCHER_SHUTDOWN_POLL_INTERVAL);
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("could not lock {}", path.display()));
+                return Err(error).with_context(|| format!("无法锁定 {}", path.display()));
             }
         }
     }
@@ -1593,33 +1798,34 @@ fn wait_for_watcher_exit(paths: &AppPaths) -> Result<()> {
 /// Walking the tree and removing each entry works on those filesystems while
 /// retaining the same symlink-safe behavior for this app-owned state tree.
 fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
-    for entry in fs::read_dir(path).with_context(|| format!("could not read {}", path.display()))? {
-        let entry =
-            entry.with_context(|| format!("could not read an entry in {}", path.display()))?;
+    for entry in fs::read_dir(path).with_context(|| format!("无法读取 {}", path.display()))? {
+        let entry = entry.with_context(|| format!("无法读取 {} 中的项目", path.display()))?;
         let entry_path = entry.path();
         let file_type = entry
             .file_type()
-            .with_context(|| format!("could not inspect {}", entry_path.display()))?;
+            .with_context(|| format!("无法检查 {}", entry_path.display()))?;
         if file_type.is_dir() && !file_type.is_symlink() {
             remove_directory_tree(&entry_path)?;
         } else {
             fs::remove_file(&entry_path)
-                .with_context(|| format!("could not remove {}", entry_path.display()))?;
+                .with_context(|| format!("无法删除 {}", entry_path.display()))?;
         }
     }
-    fs::remove_dir(path).with_context(|| format!("could not remove {}", path.display()))
+    fs::remove_dir(path).with_context(|| format!("无法删除 {}", path.display()))
 }
 
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease, receiver_type_from_index,
+        HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease,
+        existing_configuration_summary, localized_cli_command, receiver_type_from_index,
         receiver_type_index, refresh_existing_installation, remove_directory_tree,
         request_watcher_stop, validate_app_id, validate_receiver_id, wait_for_watcher_exit,
         watcher_stop_requested,
     };
     use crate::paths::AppPaths;
     use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
+    use clap::error::ErrorKind;
     use std::fs;
     use std::thread;
     use std::time::Duration;
@@ -1692,6 +1898,86 @@ mod cli_tests {
     }
 
     #[test]
+    fn command_help_uses_friendly_chinese_everywhere() {
+        let mut command = localized_cli_command();
+        let root_help = command.render_long_help().to_string();
+        assert!(root_help.contains("为 Codex 提供本地飞书通知"));
+        assert!(root_help.contains("用法："));
+        assert!(root_help.contains("命令："));
+        assert!(root_help.contains("显示帮助信息"));
+        assert!(!root_help.contains("Usage:"));
+        assert!(!root_help.contains("Commands:"));
+        assert!(!root_help.contains("Print help"));
+
+        let init_help = command
+            .find_subcommand_mut("init")
+            .expect("init 子命令")
+            .render_long_help()
+            .to_string();
+        assert!(init_help.contains("飞书 App Secret"));
+        assert!(init_help.contains("跳过确认提示"));
+        assert!(!init_help.contains("Options:"));
+        assert!(!init_help.contains("possible values"));
+
+        for name in [
+            "init",
+            "test",
+            "status",
+            "doctor",
+            "sync",
+            "update",
+            "uninstall",
+            "watch",
+        ] {
+            let mut command = localized_cli_command();
+            let help = command
+                .find_subcommand_mut(name)
+                .expect("公开子命令")
+                .render_long_help()
+                .to_string();
+            for english_framework_text in [
+                "Usage:",
+                "Options:",
+                "Print help",
+                "[default:",
+                "possible values",
+            ] {
+                assert!(
+                    !help.contains(english_framework_text),
+                    "{name} 帮助页仍包含英文：{english_framework_text}\n{help}"
+                );
+            }
+        }
+
+        let update_help = localized_cli_command()
+            .try_get_matches_from(["codex-notify", "update", "--help"])
+            .expect_err("--help 应显示帮助并退出");
+        assert_eq!(
+            update_help.kind(),
+            ErrorKind::DisplayHelp,
+            "{update_help:?}"
+        );
+    }
+
+    #[test]
+    fn existing_configuration_summary_prevents_accidental_reconfiguration() {
+        let (_app_home, _codex_home, paths) = paths();
+        let feishu = FeishuConfig {
+            app_id: "cli_existing".to_owned(),
+            receiver_id_type: ReceiverIdType::Email,
+            receiver_id: "owner@example.com".to_owned(),
+        };
+
+        let summary = existing_configuration_summary(&paths, &feishu);
+
+        assert!(summary.contains("检测到已有配置"));
+        assert!(summary.contains("无需重复初始化"));
+        assert!(summary.contains("重新配置会替换以上飞书设置"));
+        assert!(summary.contains("原有通知命令和其他 Hook 不会被删除"));
+        assert!(summary.contains("owner@example.com"));
+    }
+
+    #[test]
     fn uninstall_handshake_waits_until_the_watcher_releases_its_lease() {
         let (_app_home, _codex_home, paths) = paths();
         let lease = acquire_watcher_lease(&paths).expect("watcher lease");
@@ -1717,7 +2003,7 @@ mod cli_tests {
         let first = acquire_update_lease(&executable).expect("first update lease");
 
         let error = acquire_update_lease(&executable).expect_err("second update must be rejected");
-        assert!(error.to_string().contains("another codex-notify update"));
+        assert!(error.to_string().contains("另一个 codex-notify 升级"));
 
         drop(first);
         acquire_update_lease(&executable).expect("lease after release");

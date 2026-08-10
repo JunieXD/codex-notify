@@ -203,14 +203,12 @@ fn notify_command_from_document(document: &DocumentMut) -> Result<Option<Vec<Str
     let Some(item) = document.get("notify") else {
         return Ok(None);
     };
-    let array = item
-        .as_array()
-        .context("Codex notify must be an array of command arguments")?;
+    let array = item.as_array().context("Codex notify 必须是命令参数数组")?;
     let mut command = Vec::with_capacity(array.len());
     for argument in array.iter() {
         let argument = argument
             .as_str()
-            .context("Codex notify command arguments must be strings")?;
+            .context("Codex notify 命令参数必须是字符串")?;
         command.push(argument.to_owned());
     }
     Ok((!command.is_empty()).then_some(command))
@@ -222,9 +220,9 @@ fn notify_command_from_snapshot(
 ) -> Result<Option<Vec<String>>> {
     let document = match contents {
         Some(contents) => std::str::from_utf8(contents)
-            .with_context(|| format!("{} is not valid UTF-8", config_path.display()))?
+            .with_context(|| format!("{} 不是有效的 UTF-8 文件", config_path.display()))?
             .parse::<DocumentMut>()
-            .with_context(|| format!("could not parse {}", config_path.display()))?,
+            .with_context(|| format!("无法解析配置文件 {}", config_path.display()))?,
         None => DocumentMut::new(),
     };
     notify_command_from_document(&document)
@@ -232,7 +230,7 @@ fn notify_command_from_snapshot(
 
 pub fn set_notify_command(config_path: &Path, command: &[String]) -> Result<()> {
     if command.is_empty() {
-        bail!("cannot set an empty Codex notify command");
+        bail!("无法设置空的 Codex notify 命令");
     }
     let mut document = read_toml_document(config_path)?;
     document["notify"] = command_item(command);
@@ -245,7 +243,7 @@ fn set_notify_command_if_unchanged(
     command: &[String],
 ) -> Result<bool> {
     if command.is_empty() {
-        bail!("cannot set an empty Codex notify command");
+        bail!("无法设置空的 Codex notify 命令");
     }
     let current_contents = read_optional_file(config_path)?;
     if current_contents.as_deref() != expected_contents {
@@ -253,9 +251,9 @@ fn set_notify_command_if_unchanged(
     }
     let mut document = match expected_contents {
         Some(contents) => std::str::from_utf8(contents)
-            .with_context(|| format!("{} is not valid UTF-8", config_path.display()))?
+            .with_context(|| format!("{} 不是有效的 UTF-8 文件", config_path.display()))?
             .parse::<DocumentMut>()
-            .with_context(|| format!("could not parse {}", config_path.display()))?,
+            .with_context(|| format!("无法解析配置文件 {}", config_path.display()))?,
         None => DocumentMut::new(),
     };
     document["notify"] = command_item(command);
@@ -319,17 +317,17 @@ fn install_hook(
     let mut document = read_hooks_document(hooks_path)?;
     let root = document
         .as_object_mut()
-        .context("Codex hooks.json must contain a JSON object")?;
+        .context("Codex hooks.json 顶层必须是 JSON 对象")?;
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
-        .context("Codex hooks.json hooks value must be a JSON object")?;
+        .context("Codex hooks.json 中的 hooks 必须是 JSON 对象")?;
     let groups = hooks
         .entry(event_name)
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .with_context(|| format!("Codex {event_name} hooks must be an array"))?;
+        .with_context(|| format!("Codex {event_name} hooks 必须是数组"))?;
 
     if groups
         .iter()
@@ -390,7 +388,7 @@ pub fn remove_empty_created_codex_files(
         let document = read_toml_document(config_path)?;
         if document.as_table().is_empty() {
             fs::remove_file(config_path)
-                .with_context(|| format!("could not remove {}", config_path.display()))?;
+                .with_context(|| format!("无法删除 {}", config_path.display()))?;
         }
     }
     if installation.created_codex_hooks && hooks_path.exists() {
@@ -405,7 +403,7 @@ pub fn remove_empty_created_codex_files(
         });
         if empty {
             fs::remove_file(hooks_path)
-                .with_context(|| format!("could not remove {}", hooks_path.display()))?;
+                .with_context(|| format!("无法删除 {}", hooks_path.display()))?;
         }
     }
     Ok(())
@@ -421,7 +419,7 @@ fn remove_hook(hooks_path: &Path, event_name: &str, marker: &str) -> Result<bool
     {
         let root = document
             .as_object_mut()
-            .context("Codex hooks.json must contain a JSON object")?;
+            .context("Codex hooks.json 顶层必须是 JSON 对象")?;
         let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
             return Ok(false);
         };
@@ -475,7 +473,7 @@ pub fn backup_file(paths: &AppPaths, source: &Path, label: &str) -> Result<Optio
         .join(format!("{label}-{timestamp}.{extension}"));
     fs::copy(source, &destination).with_context(|| {
         format!(
-            "could not back up {} to {}",
+            "无法将 {} 备份到 {}",
             source.display(),
             destination.display()
         )
@@ -510,7 +508,7 @@ pub fn notify_integration_placement(
     let binary = installation
         .managed_notify
         .first()
-        .context("managed codex-notify executable is missing")?;
+        .context("缺少由 codex-notify 管理的程序路径")?;
     let canonical_managed = managed_notify_command(Path::new(binary));
     let programs = installation_managed_programs_with(installation, &canonical_managed);
     let plan = plan_notify_integration(
@@ -541,7 +539,7 @@ pub fn reconcile_notify_integration(
     let binary = installation
         .managed_notify
         .first()
-        .context("managed codex-notify executable is missing")?;
+        .context("缺少由 codex-notify 管理的程序路径")?;
     let canonical_managed = managed_notify_command(Path::new(binary));
     let programs = installation_managed_programs_with(installation, &canonical_managed);
     let config_path = paths.codex_config();
@@ -562,9 +560,7 @@ pub fn reconcile_notify_integration(
             original_config.as_deref(),
             &plan.active_command,
         )? {
-            bail!(
-                "Codex config changed while codex-notify was preparing an update; retrying on the next reconciliation"
-            );
+            bail!("codex-notify 准备同步时 Codex 配置发生了变化，将在下次检查时重试");
         }
         backup
     } else {
@@ -633,9 +629,7 @@ pub fn install_integration(
             original_config.as_deref(),
             &plan.active_command,
         )? {
-            bail!(
-                "Codex config changed while codex-notify was preparing installation; run init again"
-            );
+            bail!("codex-notify 准备写入时 Codex 配置发生了变化，请重新运行 codex-notify init");
         }
         notify_written = true;
         if has_prompt_hook(&hooks_path)? {
@@ -742,15 +736,15 @@ pub fn rollback_integration(paths: &AppPaths, setup: &IntegrationSetup) -> Resul
 pub fn run_previous_notifier(command: &[String], event_json: &str) -> Result<()> {
     let (program, arguments) = command
         .split_first()
-        .context("stored previous Codex notify command is empty")?;
+        .context("保存的原 Codex notify 命令为空")?;
     let status = Command::new(program)
         .args(arguments)
         .arg(event_json)
         .status()
-        .with_context(|| format!("could not run previous Codex notify command '{program}'"))?;
+        .with_context(|| format!("无法运行原 Codex notify 命令“{program}”"))?;
     if !status.success() {
         return Err(anyhow!(
-            "previous Codex notify command '{program}' exited with {status}"
+            "原 Codex notify 命令“{program}”退出，状态为 {status}"
         ));
     }
     Ok(())
@@ -769,19 +763,19 @@ fn read_toml_document(path: &Path) -> Result<DocumentMut> {
             return Ok(DocumentMut::new());
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", path.display()));
         }
     };
     contents
         .parse::<DocumentMut>()
-        .with_context(|| format!("could not parse {}", path.display()))
+        .with_context(|| format!("无法解析配置文件 {}", path.display()))
 }
 
 fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("无法读取 {}", path.display())),
     }
 }
 
@@ -791,21 +785,19 @@ fn restore_original_file(path: &Path, contents: Option<&[u8]>) -> Result<()> {
         None => match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                Err(error).with_context(|| format!("could not remove {}", path.display()))
-            }
+            Err(error) => Err(error).with_context(|| format!("无法删除 {}", path.display())),
         },
     }
 }
 
 fn restore_from_backup(destination: &Path, backup: Option<&Path>) -> Result<()> {
-    let contents =
-        match backup {
-            Some(backup) => Some(fs::read(backup).with_context(|| {
-                format!("could not read integration backup {}", backup.display())
-            })?),
-            None => None,
-        };
+    let contents = match backup {
+        Some(backup) => Some(
+            fs::read(backup)
+                .with_context(|| format!("无法读取接入配置备份 {}", backup.display()))?,
+        ),
+        None => None,
+    };
     restore_original_file(destination, contents.as_deref())
 }
 
@@ -824,15 +816,15 @@ fn read_hooks_document(path: &Path) -> Result<Value> {
             return Ok(json!({ "hooks": {} }));
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
+            return Err(error).with_context(|| format!("无法读取 {}", path.display()));
         }
     };
-    serde_json::from_slice(&contents).with_context(|| format!("could not parse {}", path.display()))
+    serde_json::from_slice(&contents)
+        .with_context(|| format!("无法解析 Hook 配置 {}", path.display()))
 }
 
 fn write_hooks_document(path: &Path, document: &Value) -> Result<()> {
-    let contents =
-        serde_json::to_vec_pretty(document).context("could not serialize Codex hooks")?;
+    let contents = serde_json::to_vec_pretty(document).context("无法生成 Codex Hook 配置")?;
     atomic_write(path, &contents)
 }
 
