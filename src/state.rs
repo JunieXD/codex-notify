@@ -4,10 +4,12 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const SESSION_INDEX_BLOCK_SIZE: usize = 8_192;
+const THREAD_TITLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnState {
@@ -176,6 +178,29 @@ pub fn find_thread_title(index_path: &Path, thread_id: &str) -> Option<String> {
     None
 }
 
+pub fn wait_for_thread_title(
+    index_path: &Path,
+    thread_id: &str,
+    maximum_wait: Duration,
+) -> Option<String> {
+    if thread_id.trim().is_empty() {
+        return None;
+    }
+
+    let started = Instant::now();
+    loop {
+        if let Some(title) = find_thread_title(index_path, thread_id) {
+            return Some(title);
+        }
+
+        let remaining = maximum_wait.checked_sub(started.elapsed())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        thread::sleep(remaining.min(THREAD_TITLE_POLL_INTERVAL));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionIndexRecord {
     id: String,
@@ -193,9 +218,11 @@ fn now_unix_seconds() -> u64 {
 mod tests {
     use super::{
         TurnState, elapsed_since, find_thread_title, load_turn_state, prune_turn_states,
-        remove_turn_state, turn_state_path, write_turn_state,
+        remove_turn_state, turn_state_path, wait_for_thread_title, write_turn_state,
     };
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
 
@@ -238,6 +265,67 @@ mod tests {
         assert_eq!(
             find_thread_title(&index_path, "thread-1"),
             Some("Newest title".to_owned())
+        );
+    }
+
+    #[test]
+    fn title_wait_observes_a_late_matching_index_record() {
+        let directory = tempdir().expect("temporary directory");
+        let index_path = directory.path().join("session_index.jsonl");
+        fs::write(
+            &index_path,
+            "{\"id\":\"thread-2\",\"thread_name\":\"Other\"}\n",
+        )
+        .expect("write initial index");
+
+        let writer_path = index_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let mut index = OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .expect("open session index");
+            writeln!(
+                index,
+                "{{\"id\":\"thread-1\",\"thread_name\":\"Generated title\"}}"
+            )
+            .expect("append generated title");
+        });
+
+        let title = wait_for_thread_title(&index_path, "thread-1", Duration::from_secs(1));
+        writer.join().expect("join title writer");
+        assert_eq!(title, Some("Generated title".to_owned()));
+    }
+
+    #[test]
+    fn title_wait_returns_without_delay_when_the_title_already_exists() {
+        let directory = tempdir().expect("temporary directory");
+        let index_path = directory.path().join("session_index.jsonl");
+        fs::write(
+            &index_path,
+            "{\"id\":\"thread-1\",\"thread_name\":\"Existing title\"}\n",
+        )
+        .expect("write session index");
+
+        assert_eq!(
+            wait_for_thread_title(&index_path, "thread-1", Duration::ZERO),
+            Some("Existing title".to_owned())
+        );
+    }
+
+    #[test]
+    fn title_wait_stops_after_the_requested_timeout() {
+        let directory = tempdir().expect("temporary directory");
+        let index_path = directory.path().join("session_index.jsonl");
+        fs::write(
+            &index_path,
+            "{\"id\":\"thread-2\",\"thread_name\":\"Other\"}\n",
+        )
+        .expect("write session index");
+
+        assert_eq!(
+            wait_for_thread_title(&index_path, "thread-1", Duration::from_millis(30)),
+            None
         );
     }
 

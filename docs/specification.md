@@ -283,6 +283,10 @@ The local Codex session index can provide a human-readable thread title. The
 lookup must scan from the most recent index entry and must have a safe fallback
 when the index is absent or its format changes.
 
+For a normal completion, if neither the current index nor the title captured at
+turn start provides a title, the dispatcher retries the exact thread lookup for
+up to five seconds. An already available title must not incur this delay.
+
 This lookup is an enhancement rather than a hard dependency. The tool must not
 fail a notification solely because a title cannot be found.
 

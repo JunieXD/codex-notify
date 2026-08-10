@@ -16,7 +16,7 @@ use crate::paths::AppPaths;
 use crate::settings::{InstallationConfig, atomic_write, resolved_write_path};
 use crate::state::{
     TurnState, elapsed_since, find_thread_title, load_turn_state, prune_turn_states,
-    remove_turn_state, write_turn_state,
+    remove_turn_state, wait_for_thread_title, write_turn_state,
 };
 
 pub const PROMPT_HOOK_MARKER: &str = "codex-notify: record task context";
@@ -30,6 +30,7 @@ const INTERNAL_TURN_SIGNATURES: &[&[&str]] = &[&[
     "fill the structured description field with a compact, search-oriented summary",
     "this is a keyword retrieval index, not a broad prose summary",
 ]];
+const THREAD_TITLE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionEvent {
@@ -144,12 +145,15 @@ pub fn completion_notification(paths: &AppPaths, event: &CompletionEvent) -> Res
             .map(|state| state.thread_id.as_str())
             .unwrap_or_default(),
     );
-    let title = find_thread_title(&paths.session_index(), &thread_id)
+    let session_index = paths.session_index();
+    let title = find_thread_title(&session_index, &thread_id)
         .or_else(|| {
             state
                 .as_ref()
                 .and_then(|state| state.conversation_title_at_start.clone())
+                .filter(|title| !title.trim().is_empty())
         })
+        .or_else(|| wait_for_thread_title(&session_index, &thread_id, THREAD_TITLE_WAIT_TIMEOUT))
         .unwrap_or_else(|| "Codex \u{4f1a}\u{8bdd}".to_owned());
     let elapsed = state
         .as_ref()
@@ -911,6 +915,8 @@ mod tests {
     use crate::paths::AppPaths;
     use std::fs;
     use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn paths(app_home: &Path, codex_home: &Path) -> AppPaths {
@@ -1069,6 +1075,43 @@ mod tests {
             notification.task,
             "\u{5b9e}\u{73b0}\u{98de}\u{4e66}\u{901a}\u{77e5}"
         );
+    }
+
+    #[test]
+    fn completion_waits_for_a_new_session_title() {
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = paths(app_home.path(), codex_home.path());
+        fs::write(paths.session_index(), "").expect("create session index");
+        let prompt = PromptHookEvent {
+            turn_id: "turn-new".to_owned(),
+            session_id: "thread-new".to_owned(),
+            prompt: "First task".to_owned(),
+            cwd: "/workspace".to_owned(),
+        };
+        assert!(record_prompt_context(&paths, &prompt).expect("record prompt"));
+
+        let index_path = paths.session_index();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            fs::write(
+                index_path,
+                "{\"id\":\"thread-new\",\"thread_name\":\"Generated title\"}\n",
+            )
+            .expect("write generated title");
+        });
+        let completion = CompletionEvent {
+            event_type: "agent-turn-complete".to_owned(),
+            thread_id: "thread-new".to_owned(),
+            turn_id: "turn-new".to_owned(),
+            cwd: "/workspace".to_owned(),
+            input_messages: vec!["Fallback task".to_owned()],
+            last_assistant_message: "Done".to_owned(),
+        };
+
+        let notification = completion_notification(&paths, &completion).expect("notification");
+        writer.join().expect("join title writer");
+        assert_eq!(notification.conversation_title, "Generated title");
     }
 
     #[test]
