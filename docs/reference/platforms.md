@@ -30,6 +30,8 @@ description: codex-notify 支持的操作系统、处理器架构和后台启动
 
 如果系统首次运行下载的程序时弹出安全提示，请确认文件来自项目 GitHub Release，并按照 macOS 提示允许运行。
 
+从旧版本首次升级时，系统还可能询问钥匙串权限。请确认授权对象是 macOS 自带的 `/usr/bin/security` 并选择“始终允许”；完成一次迁移后，后续版本无需重复授权。
+
 ## Windows
 
 支持 x64 Windows 10/11。App Secret 保存在 Windows 凭据管理器，watcher 使用当前用户登录启动项，不写入系统级服务。

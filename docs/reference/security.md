@@ -25,11 +25,13 @@ App Secret 不会明文写入配置文件或日志，而是保存在操作系统
 
 | 平台 | 凭据存储 |
 | --- | --- |
-| macOS | Keychain（钥匙串） |
+| macOS | Keychain（钥匙串），通过系统自带的 `/usr/bin/security` 访问 |
 | Windows | Credential Manager（凭据管理器） |
 | Linux | Secret Service，例如 GNOME Keyring |
 
 App ID、接收方式和接收者属于非密钥配置，会保存在 codex-notify 的应用数据目录中。
+
+macOS 旧版本曾让钥匙串直接信任某一版 codex-notify 的程序哈希，替换程序后可能再次询问权限。升级流程现在会在前台完成一次迁移，让 Apple 签名且路径稳定的系统凭据工具读取该条目；写入仍通过原生 Keychain API 完成。App Secret 不会出现在命令行、进程列表或日志中。
 
 ## 配置保护
 

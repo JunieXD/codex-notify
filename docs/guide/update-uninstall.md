@@ -24,6 +24,10 @@ codex-notify update
 
 升级会自动重启 watcher，不会重启 ChatGPT。已经打开的旧任务即使没有重新加载 `notify`，升级后的 watcher 也会从本地任务记录补获后续完成事件，因此通常不需要手动退出 ChatGPT。首次启用 Hook 后仍需按提示完成信任。
 
+::: tip macOS 首次迁移钥匙串权限
+从旧版本升级时，macOS 可能弹出一次钥匙串授权窗口。请选择“始终允许”；codex-notify 会把凭据访问迁移给系统自带的 `/usr/bin/security`，后续升级不会再因程序版本变化重复询问。迁移会在 watcher 重启前完成，失败时仍会恢复旧程序和后台服务。
+:::
+
 只检查是否有更新：
 
 ```sh

@@ -386,13 +386,18 @@ service.
 
 | Value | Storage |
 | --- | --- |
-| App Secret | macOS Keychain or Windows Credential Manager |
+| App Secret | macOS Keychain, Windows Credential Manager, or Linux Secret Service |
 | App ID and receiver selection | Local non-secret config file |
 | Access token | Memory only |
 
-The Rust implementation should use a cross-platform credential-store library
-behind a `SecretStore` trait. `doctor` may verify that a secret exists but must
-never print it.
+The Rust implementation should keep credential access behind a `SecretStore`
+trait. Windows and Linux use the native backends of a cross-platform credential
+library. macOS writes through the native Keychain API and reads through the
+Apple-signed, stable `/usr/bin/security` helper so a self-update does not bind
+access to one release binary's cdhash. A secret must never be passed through
+command-line arguments. Upgrades from the legacy direct-Keychain backend must
+migrate access in the foreground before restarting the watcher. `doctor` may
+verify that a secret exists but must never print it.
 
 ### 9.3 API behavior
 

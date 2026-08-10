@@ -83,6 +83,8 @@ codex-notify init
 
 选择“重新配置”，再次输入同一个应用的 App Secret。写入前会备份现有 codex-notify 配置。
 
+macOS 从旧版本首次升级时可能弹出钥匙串授权窗口，请选择“始终允许”。授权对象应为系统自带的 `/usr/bin/security`；迁移完成后，后续升级不需要重复授权。如果升级时拒绝授权，工具会恢复旧版本和原有 watcher，可以重新运行 `codex-notify update` 再试。
+
 ## 获取便于反馈的信息
 
 ```sh

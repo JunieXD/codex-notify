@@ -5,6 +5,8 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -456,11 +458,23 @@ fn init(arguments: InitArgs) -> Result<()> {
         receiver_id,
     };
     let secrets = KeyringSecretStore;
+    let existing_secret_needs_migration = existing
+        .as_ref()
+        .filter(|old| old.feishu.app_id == feishu.app_id);
+    if let Some(old) = existing_secret_needs_migration {
+        prepare_secret_access_for_configuration(&old.feishu)?;
+    }
     let previous_secret = existing
         .as_ref()
         .filter(|old| old.feishu.app_id == feishu.app_id)
         .and_then(|old| secrets.get_feishu_secret(&old.feishu).ok());
     secrets.set_feishu_secret(&feishu, &app_secret)?;
+    if existing_secret_needs_migration.is_none()
+        && let Err(error) = prepare_secret_access_for_configuration(&feishu)
+    {
+        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
+        return Err(error);
+    }
     let setup = match install_integration(
         &paths,
         &binary,
@@ -844,13 +858,14 @@ fn update_finalize(arguments: UpdateFinalizeArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let binary = fs::canonicalize(&arguments.binary)
         .with_context(|| format!("无法解析已安装程序路径 {}", arguments.binary.display()))?;
-    refresh_existing_installation(&paths, &binary, arguments.restart_watcher)
+    refresh_existing_installation(&paths, &binary, arguments.restart_watcher, true)
 }
 
 fn refresh_existing_installation(
     paths: &AppPaths,
     binary: &Path,
     restart_watcher: bool,
+    prepare_secret: bool,
 ) -> Result<()> {
     let Some(existing) = AppConfig::load(paths)? else {
         clear_watcher_stop_request(paths)?;
@@ -859,6 +874,9 @@ fn refresh_existing_installation(
         }
         return Ok(());
     };
+    if prepare_secret {
+        prepare_secret_access_after_update(&existing.feishu)?;
+    }
     let original_app_config = read_optional_file(&paths.config)?;
     let setup = install_integration(paths, binary, Some(&existing.installation))?;
     let updated = AppConfig::new(existing.feishu, setup.installation.clone());
@@ -877,6 +895,40 @@ fn refresh_existing_installation(
         })();
         return Err(with_recovery(error, recovery));
     }
+    Ok(())
+}
+
+fn prepare_secret_access_after_update(config: &FeishuConfig) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        println!("正在确认 macOS 钥匙串访问权限……");
+        println!(
+            "如果系统弹出授权窗口，请选择“始终允许”。完成这次迁移后，后续升级不再因程序版本变化重复询问。"
+        );
+        io::stdout().flush().context("无法显示钥匙串授权提示")?;
+    }
+    KeyringSecretStore
+        .prepare_stable_access(config)
+        .context("无法完成系统凭据升级；后台监听尚未重启")?;
+    #[cfg(target_os = "macos")]
+    println!("macOS 钥匙串访问已就绪。");
+    Ok(())
+}
+
+fn prepare_secret_access_for_configuration(config: &FeishuConfig) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        println!("正在准备 macOS 钥匙串访问权限……");
+        println!(
+            "如果系统弹出授权窗口，请选择“始终允许”。以后升级时无需再次授权，也不会在后台静默等待。"
+        );
+        io::stdout().flush().context("无法显示钥匙串授权提示")?;
+    }
+    KeyringSecretStore
+        .prepare_stable_access(config)
+        .context("无法准备系统凭据访问权限")?;
+    #[cfg(target_os = "macos")]
+    println!("macOS 钥匙串访问已就绪。");
     Ok(())
 }
 
@@ -2035,7 +2087,8 @@ mod cli_tests {
             .save(&paths)
             .expect("initial app config");
 
-        refresh_existing_installation(&paths, &new_binary, false).expect("refresh integration");
+        refresh_existing_installation(&paths, &new_binary, false, false)
+            .expect("refresh integration");
 
         let updated = AppConfig::load(&paths)
             .expect("load updated config")
