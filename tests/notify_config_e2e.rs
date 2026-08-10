@@ -28,6 +28,7 @@ fn fixture() -> (TempDir, TempDir, AppPaths, PathBuf) {
     let config = AppConfig::new(
         FeishuConfig {
             app_id: "cli_e2e_app".to_owned(),
+            app_secret: "secret_e2e_app".to_owned(),
             receiver_id_type: ReceiverIdType::Email,
             receiver_id: "test@example.com".to_owned(),
         },

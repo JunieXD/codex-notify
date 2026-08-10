@@ -94,8 +94,8 @@ keep command-line flags available for non-interactive automation.
 3. Detect an existing `notify` command and existing `hooks.json` entries.
 4. Explain exactly which files, credentials, and background task will be changed.
 5. Ask for Feishu App ID, App Secret, receiver type, and receiver identifier.
-6. Store the App Secret in the OS credential store.
-7. Write non-secret configuration and keep a backup when replacing it.
+6. Store the App Secret with the provider settings in the local configuration file.
+7. Write the unified configuration atomically and keep a backup when replacing it.
 8. Install the completion dispatcher, UserPromptSubmit Hook, and Stop Hook without
    deleting unrelated user configuration.
 9. Install the platform background watcher without administrator privileges.
@@ -386,18 +386,17 @@ service.
 
 | Value | Storage |
 | --- | --- |
-| App Secret | macOS Keychain, Windows Credential Manager, or Linux Secret Service |
-| App ID and receiver selection | Local non-secret config file |
+| App Secret | `~/.codex-notify/config.toml` |
+| App ID and receiver selection | `~/.codex-notify/config.toml` |
 | Access token | Memory only |
 
-The Rust implementation should keep credential access behind a `SecretStore`
-trait. Windows and Linux use the native backends of a cross-platform credential
-library. macOS writes through the native Keychain API and reads through the
-Apple-signed, stable `/usr/bin/security` helper so a self-update does not bind
-access to one release binary's cdhash. A secret must never be passed through
-command-line arguments. Upgrades from the legacy direct-Keychain backend must
-migrate access in the foreground before restarting the watcher. `doctor` may
-verify that a secret exists but must never print it.
+The configuration file contains plaintext credentials. On Unix, the application
+directory and configuration file use modes `0700` and `0600`; Windows relies on
+the current user's home-directory ACL. A secret must never be passed through
+command-line arguments during normal interactive use, printed by `status` or
+`doctor`, or written to diagnostics. Upgrades from credential-store releases
+read the legacy secret once, back up and rewrite the v1 configuration as v2,
+then attempt to delete the legacy credential.
 
 ### 9.3 API behavior
 
@@ -425,19 +424,30 @@ Provider configuration must be namespaced. Adding a provider must not require
 changing the event model, Codex dispatcher, watcher, or existing Feishu
 configuration.
 
-## 11. Local File Layout
+Configuration version 2 stores named provider instances. The map key is a
+stable user-local instance ID; `type` selects the provider adapter. The schema
+reserves multiple instances of the same type, while the current Feishu-only
+dispatcher uses one enabled Feishu instance.
 
-The exact platform-specific base directory follows native conventions:
+```toml
+version = 2
 
-```text
-macOS:   ~/Library/Application Support/codex-notify/
-Windows: %APPDATA%\\codex-notify\\
+[providers.feishu]
+type = "feishu"
+enabled = true
+app_id = "cli_example"
+app_secret = "replace-me"
+receiver_id_type = "email"
+receiver_id = "owner@example.com"
 ```
 
-Under that base directory:
+## 11. Local File Layout
+
+The application data directory is `~/.codex-notify` on every supported
+platform. Under that directory:
 
 ```text
-config.toml          Non-secret provider and behavior configuration
+config.toml          Provider settings, plaintext credentials, and installation metadata
 state/               Atomic, short-lived turn and deduplication state
 logs/                Capped diagnostics log
 backups/             Installer-created configuration backups
@@ -469,9 +479,8 @@ an unexpected process exit is recovered at the next login.
 `init` installs a per-user systemd unit at
 `~/.config/systemd/user/codex-notify-watcher.service`. It starts
 `codex-notify watch` with the user session, restarts after unexpected failures,
-and does not require a system-wide service or administrator privileges. Linux
-credential storage uses the desktop Secret Service and must never fall back to
-a plaintext file.
+and does not require a system-wide service, administrator privileges, or a
+desktop Secret Service.
 
 ### 12.4 Watcher behavior
 
@@ -487,7 +496,7 @@ rotation or truncation safely.
 - No relay service.
 - Prompt text and final output leave the machine only for the Feishu recipient
   selected by the user.
-- Secrets are stored in OS credential storage.
+- Provider credentials are stored in the user-only local configuration file.
 - Configuration writes are explicit, backed up, and reversible.
 - `doctor` redacts credentials and sensitive identifiers in human output.
 - Release artifacts include SHA-256 checksums.
@@ -515,7 +524,7 @@ src/
   core/               notification model, duration, redaction, deduplication
   providers/          provider trait and Feishu adapter
   platform/           macOS, Windows, and Linux background-service adapters
-  secrets/            credential-store abstraction
+  settings/           versioned provider configuration and legacy migration
   transcripts/        incremental transcript sources and fixtures
 ```
 
@@ -523,7 +532,7 @@ Recommended Rust boundaries:
 
 - `clap` for stable CLI parsing and generated help.
 - `serde`, `serde_json`, and `toml_edit` for structured data/configuration.
-- `keyring` or an equivalent OS credential-store abstraction.
+- A legacy-only credential reader for migrating pre-v2 installations.
 - `reqwest` with explicit timeouts for Feishu requests.
 - `tokio` only where asynchronous I/O provides a clear benefit.
 - `thiserror` for user-facing typed errors.
@@ -594,7 +603,7 @@ Installed standalone binaries expose `codex-notify update`. The command and
 the first-party install scripts share one update transaction: resolve a
 release, verify its `SHA256SUMS` entry and staged version, stop (but do not
 uninstall) the watcher, replace the executable, refresh the existing
-integration without reading or replacing the Feishu secret, restart the
+integration without changing the Feishu secret, restart the
 watcher, and verify the new process. Any failure after replacement restores
 the previous executable and watcher. Re-running an install script delegates to
 this command when available; a downloaded newer binary performs the same
@@ -620,7 +629,7 @@ upgrade, signing, and compatibility behavior are stable.
 
 ### M1: Feishu completion notifications
 
-- Feishu configuration and secure secret storage.
+- Feishu configuration and user-only local credential storage.
 - Card renderer and `notify` dispatcher.
 - Existing notify-command preservation.
 - `init`, `test`, `status`, and `uninstall`.

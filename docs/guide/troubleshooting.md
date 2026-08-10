@@ -75,7 +75,7 @@ codex-notify watch --once
 
 ## App Secret 无法读取
 
-系统凭据可能被删除、锁定或迁移失败。重新运行：
+本地配置中的 App Secret 可能缺失，或者从旧版系统凭据库迁移时读取失败。重新运行：
 
 ```sh
 codex-notify init
@@ -83,7 +83,7 @@ codex-notify init
 
 选择“重新配置”，再次输入同一个应用的 App Secret。写入前会备份现有 codex-notify 配置。
 
-macOS 从旧版本首次升级时可能弹出钥匙串授权窗口，请选择“始终允许”。授权对象应为系统自带的 `/usr/bin/security`；迁移完成后，后续升级不需要重复授权。如果升级时拒绝授权，工具会恢复旧版本和原有 watcher，可以重新运行 `codex-notify update` 再试。
+若错误发生在旧版迁移阶段，请确认旧凭据库仍可访问，再重新运行升级。macOS 可能弹出钥匙串授权窗口，请允许系统自带的 `/usr/bin/security` 读取这一次；迁移完成后，后续升级不再访问钥匙串。
 
 ## 获取便于反馈的信息
 

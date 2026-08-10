@@ -8,87 +8,41 @@ use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Output};
 
-use crate::settings::FeishuConfig;
+use crate::settings::LegacyFeishuConfig;
 
 const SERVICE_NAME: &str = "codex-notify";
 #[cfg(target_os = "macos")]
 const MACOS_SECURITY: &str = "/usr/bin/security";
 
-pub trait SecretStore {
-    fn set_feishu_secret(&self, config: &FeishuConfig, secret: &str) -> Result<()>;
-    fn get_feishu_secret(&self, config: &FeishuConfig) -> Result<String>;
-    fn delete_feishu_secret(&self, config: &FeishuConfig) -> Result<()>;
-}
-
 #[derive(Debug, Default)]
-pub struct KeyringSecretStore;
+pub struct LegacyKeyringSecretStore;
 
-impl KeyringSecretStore {
-    fn entry(&self, config: &FeishuConfig) -> Result<Entry> {
+impl LegacyKeyringSecretStore {
+    fn entry(&self, config: &LegacyFeishuConfig) -> Result<Entry> {
         Entry::new(SERVICE_NAME, &config.secret_account_name()).context("无法访问系统凭据库")
     }
 
-    /// Make an existing macOS credential trust Apple's stable `security`
-    /// helper instead of the hash of one particular codex-notify binary.
-    ///
-    /// Older releases used the native Keychain API directly. macOS therefore
-    /// attached the executable's cdhash to the item, and every self-update
-    /// could block the background watcher behind a new authorization dialog.
-    /// Reading once in the foreground through `/usr/bin/security` lets the
-    /// user add that stable Apple-signed helper to the ACL.
-    pub fn prepare_stable_access(&self, config: &FeishuConfig) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            self.get_feishu_secret(config)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = config;
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl SecretStore for KeyringSecretStore {
-    fn set_feishu_secret(&self, config: &FeishuConfig, secret: &str) -> Result<()> {
-        self.entry(config)?
-            .set_password(secret)
-            .context("无法将飞书 App Secret 保存到系统凭据库")
-    }
-
-    fn get_feishu_secret(&self, config: &FeishuConfig) -> Result<String> {
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn get_feishu_secret(&self, config: &LegacyFeishuConfig) -> Result<String> {
         self.entry(config)?
             .get_password()
-            .context("系统凭据库中没有可用的飞书 App Secret")
+            .context("无法从旧版系统凭据库读取飞书 App Secret")
     }
 
-    fn delete_feishu_secret(&self, config: &FeishuConfig) -> Result<()> {
-        self.entry(config)?
-            .delete_credential()
-            .context("无法从系统凭据库删除飞书 App Secret")
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl SecretStore for KeyringSecretStore {
-    fn set_feishu_secret(&self, config: &FeishuConfig, secret: &str) -> Result<()> {
-        self.entry(config)?
-            .set_password(secret)
-            .context("无法将飞书 App Secret 保存到 macOS 钥匙串")
-    }
-
-    fn get_feishu_secret(&self, config: &FeishuConfig) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn get_feishu_secret(&self, config: &LegacyFeishuConfig) -> Result<String> {
         let output = Command::new(MACOS_SECURITY)
             .args(macos_find_arguments(&config.secret_account_name()))
             .output()
             .context("无法启动 macOS 系统凭据工具")?;
-        let output = require_macos_security_success(output, "读取飞书 App Secret")?;
+        let output = require_macos_security_success(output, "读取旧版飞书 App Secret")?;
         decode_macos_secret(output.stdout)
     }
 
-    fn delete_feishu_secret(&self, config: &FeishuConfig) -> Result<()> {
+    pub(crate) fn delete_feishu_secret(&self, config: &LegacyFeishuConfig) -> Result<()> {
         self.entry(config)?
             .delete_credential()
-            .context("无法从 macOS 钥匙串删除飞书 App Secret")
+            .context("无法从旧版系统凭据库删除飞书 App Secret")
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "codex-notify"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-platform local notifications for Codex, starting with Feishu."
@@ -22,6 +22,7 @@ dialoguer = "0.11"
 directories = "6.0"
 fs2 = "0.4"
 flate2 = "1.1"
+# Legacy-only dependency used to migrate v1 credentials into config.toml.
 keyring = { version = "3.6", features = [
     "apple-native",
     "windows-native",

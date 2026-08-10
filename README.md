@@ -24,7 +24,7 @@
 - **登录自启**：安装低资源占用的后台 watcher，无需管理员权限。
 - **兼容 Computer Use**：保持 Computer Use 在通知链最外层，避免重复执行。
 - **适配多套配置**：切换 `config.toml` 后自动补回集成，并保留各自原有 notifier。
-- **安全存储**：App Secret 仅保存在系统钥匙串或凭据管理器中。
+- **统一配置**：消息平台设置和凭据统一保存在 `~/.codex-notify/config.toml`，便于备份和迁移。
 - **随时撤销**：保留原有 Codex notifier，卸载时恢复原配置。
 
 ## 支持平台
@@ -116,7 +116,7 @@ codex-notify update
 ## 隐私与安全
 
 - 没有云端中转服务、遥测或行为分析。
-- App Secret 不会写入配置文件或日志。
+- App Secret 会明文写入仅限当前用户访问的 `~/.codex-notify/config.toml`，但不会写入日志或状态输出。
 - 任务内容和结果只发送给你配置的飞书接收者。
 - 修改 Codex 配置前会在本地创建带时间戳的备份。
 

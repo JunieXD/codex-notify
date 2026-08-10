@@ -21,21 +21,18 @@ description: codex-notify 读取哪些本地信息、如何保存密钥，以及
 
 ## App Secret 如何保存
 
-App Secret 不会明文写入配置文件或日志，而是保存在操作系统提供的凭据库：
+消息平台设置和凭据统一保存在用户目录下的 `~/.codex-notify/config.toml`。App Secret 是明文，采用本地文件是为了简化跨平台安装、升级、备份和未来消息平台扩展。
 
-| 平台 | 凭据存储 |
-| --- | --- |
-| macOS | Keychain（钥匙串），通过系统自带的 `/usr/bin/security` 访问 |
-| Windows | Credential Manager（凭据管理器） |
-| Linux | Secret Service，例如 GNOME Keyring |
+在 Unix 系统上，codex-notify 会把 `.codex-notify` 目录权限设为 `700`，把原子写入的配置文件权限设为 `600`。Windows 则依赖当前用户目录的访问控制。状态、诊断和日志不会显示或记录 App Secret。
 
-App ID、接收方式和接收者属于非密钥配置，会保存在 codex-notify 的应用数据目录中。
+从使用系统凭据库的旧版本升级时，程序会读取一次旧 App Secret，将旧版 `config.toml` 备份后写成新版统一配置，并尝试删除旧凭据。旧版平台应用数据目录会复制到 `~/.codex-notify`；原目录暂时保留，只用于保证升级失败时旧程序仍可回退。
 
-macOS 旧版本曾让钥匙串直接信任某一版 codex-notify 的程序哈希，替换程序后可能再次询问权限。升级流程现在会在前台完成一次迁移，让 Apple 签名且路径稳定的系统凭据工具读取该条目；写入仍通过原生 Keychain API 完成。App Secret 不会出现在命令行、进程列表或日志中。
+不要提交、公开分享或放宽 `config.toml` 的文件权限；能够读取该文件的程序或用户也能够取得消息平台凭据。
 
 ## 配置保护
 
 - 修改 Codex 配置前会创建带时间戳的备份；
+- 重新配置 codex-notify 时，旧 `config.toml` 的备份也会包含当时的明文凭据，并保存在同一个受限应用目录下；
 - TOML 和 JSON 会经过解析后修改，不使用容易破坏格式的文本替换；
 - 现有 notifier 和无关 Hook 会保留；
 - 未知或损坏的 Computer Use 包装不会被强行覆盖；
@@ -60,7 +57,7 @@ codex-notify uninstall
 
 ## 使用建议
 
-- 不要把 App Secret 写在 Shell 脚本、截图或问题报告中；
+- 不要把 App Secret 或完整的 `~/.codex-notify/config.toml` 放进 Shell 脚本、截图、代码仓库或问题报告；
 - 飞书应用只开通发送消息所需的最小权限；
 - 使用群聊接收通知前，确认群成员都可以查看任务内容；
 - 分享 `status --json` 或 `doctor --json` 前，对邮箱和本地路径进行必要脱敏。

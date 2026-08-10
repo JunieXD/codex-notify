@@ -39,8 +39,8 @@ codex-notify --version
 
 如果终端提示找不到命令，请按照安装脚本最后显示的说明把安装目录加入 `PATH`，然后重新打开终端。
 
-::: info Linux 桌面环境
-Linux 需要 systemd 用户会话和 Secret Service。Ubuntu 桌面通常已经包含 GNOME Keyring，无需额外配置。
+::: info Linux 环境
+Linux 后台监听需要 systemd 用户会话，但不再依赖 GNOME Keyring 或其他 Secret Service。
 :::
 
 ## 2. 准备飞书应用
@@ -63,6 +63,8 @@ codex-notify init
 4. 接收者邮箱或对应 ID。
 
 App Secret 输入时不会显示字符，这是正常现象。确认前不会修改任何文件；确认后会先备份现有 Codex 配置，再写入通知链和 Hook。
+
+消息平台配置和 App Secret 会统一写入用户目录下的 `~/.codex-notify/config.toml`。App Secret 是明文，请不要提交、同步或分享这个文件。
 
 如果已经配置过，再次运行 `init` 会显示不含密钥的配置摘要，并默认保留当前配置。只有主动选择“重新配置”才会替换飞书设置。
 

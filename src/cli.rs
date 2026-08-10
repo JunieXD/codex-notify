@@ -5,8 +5,6 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
-#[cfg(target_os = "macos")]
-use std::io::Write;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -27,8 +25,10 @@ use crate::monitor;
 use crate::notify_config::parse_forward_notify;
 use crate::paths::AppPaths;
 use crate::platform;
-use crate::secrets::{KeyringSecretStore, SecretStore};
-use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType, atomic_write, resolved_write_path};
+use crate::secrets::LegacyKeyringSecretStore;
+use crate::settings::{
+    AppConfig, FeishuConfig, ReceiverIdType, StoredConfig, atomic_write, resolved_write_path,
+};
 use crate::updater::{
     self, DEFAULT_REPOSITORY, PreparedRelease, executable_version, install_executable,
     remove_executable, replace_current_executable,
@@ -359,7 +359,7 @@ fn localized_usage(command_name: &str) -> Option<&'static str> {
 
 fn init(arguments: InitArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let existing = AppConfig::load(&paths)?;
+    let existing = load_app_config(&paths)?;
     let reconfiguring = existing.is_some();
     let original_app_config = read_optional_file(&paths.config)?;
     let theme = ColorfulTheme::default();
@@ -393,7 +393,8 @@ fn init(arguments: InitArgs) -> Result<()> {
         arguments.app_id,
         existing
             .as_ref()
-            .map(|config| config.feishu.app_id.as_str()),
+            .and_then(|config| config.feishu().ok())
+            .map(|config| config.app_id.as_str()),
         "请输入飞书 App ID",
         "App ID",
         validate_app_id,
@@ -404,13 +405,15 @@ fn init(arguments: InitArgs) -> Result<()> {
         arguments.receiver_id_type,
         existing
             .as_ref()
-            .map(|config| config.feishu.receiver_id_type),
+            .and_then(|config| config.feishu().ok())
+            .map(|config| config.receiver_id_type),
         &theme,
     )?;
     let receiver_default = existing
         .as_ref()
-        .filter(|config| config.feishu.receiver_id_type == receiver_id_type)
-        .map(|config| config.feishu.receiver_id.as_str());
+        .and_then(|config| config.feishu().ok())
+        .filter(|config| config.receiver_id_type == receiver_id_type)
+        .map(|config| config.receiver_id.as_str());
     if arguments.receiver_id.is_none() {
         print_receiver_help(receiver_id_type);
     }
@@ -460,62 +463,36 @@ fn init(arguments: InitArgs) -> Result<()> {
     };
     let feishu = FeishuConfig {
         app_id,
+        app_secret,
         receiver_id_type,
         receiver_id,
     };
-    let secrets = KeyringSecretStore;
-    let existing_secret_needs_migration = existing
-        .as_ref()
-        .filter(|old| old.feishu.app_id == feishu.app_id);
-    if let Some(old) = existing_secret_needs_migration {
-        prepare_secret_access_for_configuration(&old.feishu)?;
-    }
-    let previous_secret = existing
-        .as_ref()
-        .filter(|old| old.feishu.app_id == feishu.app_id)
-        .and_then(|old| secrets.get_feishu_secret(&old.feishu).ok());
-    secrets.set_feishu_secret(&feishu, &app_secret)?;
-    if existing_secret_needs_migration.is_none()
-        && let Err(error) = prepare_secret_access_for_configuration(&feishu)
-    {
-        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
-        return Err(error);
-    }
-    let setup = match install_integration(
+    let setup = install_integration(
         &paths,
         &binary,
         existing.as_ref().map(|config| &config.installation),
-    ) {
-        Ok(setup) => setup,
-        Err(error) => {
-            restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
-            return Err(error);
+    )?;
+    let config = match existing.clone() {
+        Some(mut config) => {
+            config.replace_feishu(feishu.clone());
+            config.installation = setup.installation.clone();
+            config
         }
+        None => AppConfig::new(feishu.clone(), setup.installation.clone()),
     };
-    let config = AppConfig::new(feishu.clone(), setup.installation.clone());
     if let Err(error) = config.save(&paths) {
         let _ = rollback_integration(&paths, &setup);
-        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
         return Err(error);
     }
     if let Err(error) = clear_watcher_stop_request(&paths) {
         let _ = rollback_integration(&paths, &setup);
         let _ = restore_optional_file(&paths.config, original_app_config.as_deref());
-        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
         return Err(error);
     }
     if let Err(error) = platform::install_watcher(&paths, &binary) {
         let _ = rollback_integration(&paths, &setup);
         let _ = restore_optional_file(&paths.config, original_app_config.as_deref());
-        restore_feishu_secret(&secrets, &feishu, previous_secret.as_deref());
         return Err(error);
-    }
-
-    if let Some(old_config) = existing
-        .as_ref()
-        .filter(|old| old.feishu.app_id != feishu.app_id)
-    {
-        let _ = secrets.delete_feishu_secret(&old_config.feishu);
     }
 
     if config
@@ -573,21 +550,21 @@ fn send_test() -> Result<()> {
 }
 
 fn send_test_for(config: &AppConfig) -> Result<()> {
-    let secret = KeyringSecretStore.get_feishu_secret(&config.feishu)?;
+    let feishu = config.feishu()?;
     let notification = Notification::completed(
         "codex-notify 测试通知",
         "检查飞书通知是否可以正常送达",
-        "飞书连接、系统凭据和通知卡片均工作正常。",
+        "飞书连接、本地配置和通知卡片均工作正常。",
         Some(Duration::from_secs(2)),
         "test-notification",
     );
-    FeishuClient::new()?.send(&config.feishu, &secret, &notification)?;
+    FeishuClient::new()?.send(feishu, &notification)?;
     Ok(())
 }
 
 fn status(json_output: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let config = AppConfig::load(&paths)?;
+    let config = load_app_config(&paths)?;
     let data = inspection(&paths, config.as_ref())?;
     print_inspection(&data, json_output, false);
     Ok(())
@@ -595,7 +572,7 @@ fn status(json_output: bool) -> Result<()> {
 
 fn doctor(json_output: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let config = AppConfig::load(&paths)?;
+    let config = load_app_config(&paths)?;
     let data = inspection(&paths, config.as_ref())?;
     print_inspection(&data, json_output, true);
     Ok(())
@@ -756,7 +733,7 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
     fs::create_dir_all(target_parent)
         .with_context(|| format!("无法创建目录 {}", target_parent.display()))?;
     let _update_lease = acquire_update_lease(&target)?;
-    let existing_config = AppConfig::load(&paths)?;
+    let existing_config = AppConfig::load_stored(&paths)?;
     // A watcher launcher is user-global on every supported platform. It may
     // belong to another CODEX_NOTIFY_HOME, so it must not turn an otherwise
     // standalone first install into a coordinated upgrade.
@@ -764,7 +741,7 @@ fn install_prepared(arguments: InstallPreparedArgs) -> Result<()> {
     let restart_watcher = coordinated_upgrade && platform::is_watcher_installed(&paths)?;
     let previous_binary = existing_config
         .as_ref()
-        .and_then(|config| config.installation.managed_notify.first())
+        .and_then(|config| config.installation().managed_notify.first())
         .map(PathBuf::from)
         .filter(|path| path.exists())
         .unwrap_or_else(|| target.clone());
@@ -866,29 +843,30 @@ fn update_finalize(arguments: UpdateFinalizeArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let binary = fs::canonicalize(&arguments.binary)
         .with_context(|| format!("无法解析已安装程序路径 {}", arguments.binary.display()))?;
-    refresh_existing_installation(&paths, &binary, arguments.restart_watcher, true)
+    refresh_existing_installation(&paths, &binary, arguments.restart_watcher)
 }
 
 fn refresh_existing_installation(
     paths: &AppPaths,
     binary: &Path,
     restart_watcher: bool,
-    prepare_secret: bool,
 ) -> Result<()> {
-    let Some(existing) = AppConfig::load(paths)? else {
+    let original_app_config = read_optional_file(&paths.config)?;
+    let Some(pending) = load_app_config_for_update(paths)? else {
         clear_watcher_stop_request(paths)?;
         if restart_watcher {
             platform::install_watcher(paths, binary)?;
         }
         return Ok(());
     };
-    if prepare_secret {
-        prepare_secret_access_after_update(&existing.feishu)?;
-    }
-    let original_app_config = read_optional_file(&paths.config)?;
+    let existing = pending.config;
     let setup = install_integration(paths, binary, Some(&existing.installation))?;
-    let updated = AppConfig::new(existing.feishu, setup.installation.clone());
+    let mut updated = existing;
+    updated.installation = setup.installation.clone();
     let result = (|| {
+        if pending.legacy_feishu.is_some() {
+            let _ = backup_file(paths, &paths.config, "config-v1-before-local-credential")?;
+        }
         updated.save(paths)?;
         clear_watcher_stop_request(paths)?;
         if restart_watcher {
@@ -903,40 +881,14 @@ fn refresh_existing_installation(
         })();
         return Err(with_recovery(error, recovery));
     }
-    Ok(())
-}
-
-fn prepare_secret_access_after_update(config: &FeishuConfig) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    if let Some(legacy_feishu) = pending.legacy_feishu
+        && let Err(error) = LegacyKeyringSecretStore.delete_feishu_secret(&legacy_feishu)
     {
-        println!("正在确认 macOS 钥匙串访问权限……");
-        println!(
-            "如果系统弹出授权窗口，请选择“始终允许”。完成这次迁移后，后续升级不再因程序版本变化重复询问。"
+        diagnostics::record(
+            paths,
+            &format!("旧版系统凭据未能删除，但本地配置迁移已经完成：{error:#}"),
         );
-        io::stdout().flush().context("无法显示钥匙串授权提示")?;
     }
-    KeyringSecretStore
-        .prepare_stable_access(config)
-        .context("无法完成系统凭据升级；后台监听尚未重启")?;
-    #[cfg(target_os = "macos")]
-    println!("macOS 钥匙串访问已就绪。");
-    Ok(())
-}
-
-fn prepare_secret_access_for_configuration(config: &FeishuConfig) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        println!("正在准备 macOS 钥匙串访问权限……");
-        println!(
-            "如果系统弹出授权窗口，请选择“始终允许”。以后升级时无需再次授权，也不会在后台静默等待。"
-        );
-        io::stdout().flush().context("无法显示钥匙串授权提示")?;
-    }
-    KeyringSecretStore
-        .prepare_stable_access(config)
-        .context("无法准备系统凭据访问权限")?;
-    #[cfg(target_os = "macos")]
-    println!("macOS 钥匙串访问已就绪。");
     Ok(())
 }
 
@@ -995,12 +947,9 @@ fn combine_recovery_steps(first: Result<()>, second: Result<()>) -> Result<()> {
 
 fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json::Value> {
     let secret_status = config
-        .map(|config| {
-            if KeyringSecretStore.get_feishu_secret(&config.feishu).is_ok() {
-                "present"
-            } else {
-                "unavailable"
-            }
+        .map(|config| match config.feishu() {
+            Ok(feishu) if !feishu.app_secret.trim().is_empty() => "present",
+            _ => "unavailable",
         })
         .unwrap_or("not_configured");
     let (notifier_status, notifier_mode) = match config {
@@ -1022,13 +971,16 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
         "app_data_directory": paths.root,
         "codex_home": paths.codex_home,
         "credential_store": secret_status,
+        "credential_storage": "config_file",
         "codex_notify_installed": notifier_status,
         "notify_integration": notifier_mode,
         "prompt_hook_installed": hook_status,
         "stop_hook_installed": stop_hook_status,
         "background_watcher_installed": watcher_status,
         "watch_interval_seconds": monitor::WATCH_INTERVAL.as_secs(),
-        "feishu_receiver_id_type": config.map(|config| config.feishu.receiver_id_type.as_api_value()),
+        "feishu_receiver_id_type": config
+            .and_then(|config| config.feishu().ok())
+            .map(|config| config.receiver_id_type.as_api_value()),
     }))
 }
 
@@ -1053,7 +1005,7 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     println!("codex-notify 状态");
     println!("-----------------");
     println!("配置状态：{}", if configured { "已完成" } else { "未配置" });
-    println!("系统凭据：{}", credential_status_name(secret));
+    println!("本地凭据：{}", credential_status_name(secret));
     println!(
         "Codex 通知接入：{}（{}）",
         if notifier { "正常" } else { "未生效" },
@@ -1156,7 +1108,6 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
     let _ = remove_prompt_hook(&hooks_path)?;
     let _ = remove_stop_hook(&hooks_path)?;
     remove_empty_created_codex_files(&config_path, &hooks_path, &config.installation)?;
-    let _ = KeyringSecretStore.delete_feishu_secret(&config.feishu);
     let _ = fs::remove_file(&paths.config);
     if paths.state.exists() {
         remove_directory_tree(&paths.state)?;
@@ -1167,7 +1118,7 @@ fn uninstall(arguments: UninstallArgs) -> Result<()> {
 
 fn notify(event_json: String, managed: bool, forward_notify: Option<String>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let config = AppConfig::load(&paths)?;
+    let config = load_app_config(&paths)?;
     let embedded_previous = forward_notify
         .as_deref()
         .map(parse_forward_notify)
@@ -1268,7 +1219,7 @@ fn watch(arguments: WatchArgs) -> Result<()> {
         }
         if arguments.once || now >= next_config_reconcile {
             if !arguments.once {
-                let Some(latest_config) = AppConfig::load(&paths)? else {
+                let Some(latest_config) = load_app_config(&paths)? else {
                     return Ok(());
                 };
                 config = latest_config;
@@ -1349,8 +1300,8 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
     if deliveries.is_empty() {
         return Ok(0);
     }
-    let secret = match KeyringSecretStore.get_feishu_secret(&config.feishu) {
-        Ok(secret) => secret,
+    let feishu = match config.feishu() {
+        Ok(feishu) => feishu,
         Err(error) => {
             for delivery in deliveries {
                 let _ = monitor::settle_delivery(paths, &delivery.key, false);
@@ -1370,7 +1321,7 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
 
     let mut delivered = 0;
     for delivery in deliveries {
-        match client.send(&config.feishu, &secret, &delivery.notification) {
+        match client.send(feishu, &delivery.notification) {
             Ok(_) => {
                 monitor::settle_delivery(paths, &delivery.key, true)?;
                 delivered += 1;
@@ -1385,7 +1336,89 @@ fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
 }
 
 fn configured(paths: &AppPaths) -> Result<AppConfig> {
-    AppConfig::load(paths)?.context("codex-notify 尚未配置，请先运行 codex-notify init")
+    load_app_config(paths)?.context("codex-notify 尚未配置，请先运行 codex-notify init")
+}
+
+fn load_app_config(paths: &AppPaths) -> Result<Option<AppConfig>> {
+    let secrets = LegacyKeyringSecretStore;
+    load_app_config_with_legacy_store(
+        paths,
+        |config| secrets.get_feishu_secret(config),
+        |config| secrets.delete_feishu_secret(config),
+    )
+}
+
+fn load_app_config_with_legacy_store<G, D>(
+    paths: &AppPaths,
+    get_secret: G,
+    delete_secret: D,
+) -> Result<Option<AppConfig>>
+where
+    G: Fn(&crate::settings::LegacyFeishuConfig) -> Result<String>,
+    D: Fn(&crate::settings::LegacyFeishuConfig) -> Result<()>,
+{
+    match AppConfig::load_stored(paths)? {
+        Some(StoredConfig::Current(config)) => Ok(Some(config)),
+        Some(StoredConfig::Legacy(legacy)) => {
+            let legacy_feishu = legacy.feishu.clone();
+            let app_secret =
+                get_secret(&legacy_feishu).context("无法迁移旧版飞书凭据；原配置尚未修改")?;
+            let config = migrate_legacy_config(paths, legacy, app_secret)?;
+            if let Err(error) = delete_secret(&legacy_feishu) {
+                diagnostics::record(
+                    paths,
+                    &format!("旧版系统凭据未能删除，但本地配置迁移已经完成：{error:#}"),
+                );
+            }
+            Ok(Some(config))
+        }
+        None => Ok(None),
+    }
+}
+
+struct PendingAppConfig {
+    config: AppConfig,
+    legacy_feishu: Option<crate::settings::LegacyFeishuConfig>,
+}
+
+fn load_app_config_for_update(paths: &AppPaths) -> Result<Option<PendingAppConfig>> {
+    let secrets = LegacyKeyringSecretStore;
+    load_app_config_for_update_with_legacy_store(paths, |config| secrets.get_feishu_secret(config))
+}
+
+fn load_app_config_for_update_with_legacy_store<G>(
+    paths: &AppPaths,
+    get_secret: G,
+) -> Result<Option<PendingAppConfig>>
+where
+    G: Fn(&crate::settings::LegacyFeishuConfig) -> Result<String>,
+{
+    match AppConfig::load_stored(paths)? {
+        Some(StoredConfig::Current(config)) => Ok(Some(PendingAppConfig {
+            config,
+            legacy_feishu: None,
+        })),
+        Some(StoredConfig::Legacy(legacy)) => {
+            let legacy_feishu = legacy.feishu.clone();
+            let app_secret = get_secret(&legacy_feishu).context("无法读取待迁移的旧版飞书凭据")?;
+            Ok(Some(PendingAppConfig {
+                config: legacy.into_current(app_secret),
+                legacy_feishu: Some(legacy_feishu),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+fn migrate_legacy_config(
+    paths: &AppPaths,
+    legacy: crate::settings::LegacyAppConfig,
+    app_secret: String,
+) -> Result<AppConfig> {
+    let _ = backup_file(paths, &paths.config, "config-v1-before-local-credential")?;
+    let config = legacy.into_current(app_secret);
+    config.save(paths)?;
+    Ok(config)
 }
 
 fn choose_action(
@@ -1406,15 +1439,15 @@ fn choose_action(
 }
 
 fn print_existing_configuration(paths: &AppPaths, config: &AppConfig) {
-    println!(
-        "\n{}",
-        existing_configuration_summary(paths, &config.feishu)
-    );
+    match config.feishu() {
+        Ok(feishu) => println!("\n{}", existing_configuration_summary(paths, feishu)),
+        Err(error) => println!("\n检测到已有配置，但无法读取飞书设置：{error:#}"),
+    }
 }
 
 fn existing_configuration_summary(paths: &AppPaths, feishu: &FeishuConfig) -> String {
     format!(
-        "检测到已有配置\n----------------\ncodex-notify 已经配置完成，无需重复初始化。\n  App ID：{}\n  接收方式：{}（{}）\n  接收者：{}\n  配置文件：{}\nApp Secret 已保存在系统凭据库中，这里不会显示。\n重新配置会替换以上飞书设置；Codex 原有通知命令和其他 Hook 不会被删除。",
+        "检测到已有配置\n----------------\ncodex-notify 已经配置完成，无需重复初始化。\n  App ID：{}\n  接收方式：{}（{}）\n  接收者：{}\n  配置文件：{}\nApp Secret 已保存在本地配置文件中，这里不会显示。\n重新配置会替换以上飞书设置；Codex 原有通知命令和其他 Hook 不会被删除。",
         feishu.app_id,
         receiver_type_name(feishu.receiver_id_type),
         feishu.receiver_id_type.as_api_value(),
@@ -1505,7 +1538,7 @@ fn secret_value(value: Option<String>, theme: &ColorfulTheme) -> Result<String> 
                 })
                 .interact()
                 .context("无法读取 App Secret")?;
-            println!("App Secret 已收到；稍后会安全保存到系统凭据库，不会写入配置文件。");
+            println!("App Secret 已收到；稍后会写入用户目录中的 codex-notify 配置文件。");
             value
         }
     };
@@ -1513,21 +1546,6 @@ fn secret_value(value: Option<String>, theme: &ColorfulTheme) -> Result<String> 
         bail!("App Secret 不能为空");
     }
     Ok(value)
-}
-
-fn restore_feishu_secret(
-    secrets: &KeyringSecretStore,
-    config: &FeishuConfig,
-    previous_secret: Option<&str>,
-) {
-    match previous_secret {
-        Some(secret) => {
-            let _ = secrets.set_feishu_secret(config, secret);
-        }
-        None => {
-            let _ = secrets.delete_feishu_secret(config);
-        }
-    }
 }
 
 fn receiver_type_value(
@@ -1872,7 +1890,8 @@ fn remove_directory_tree(path: &std::path::Path) -> Result<()> {
 mod cli_tests {
     use super::{
         FEISHU_SETUP_GUIDE_URL, HOOK_TRUST_GUIDANCE, acquire_update_lease, acquire_watcher_lease,
-        existing_configuration_summary, localized_cli_command, receiver_type_from_index,
+        existing_configuration_summary, load_app_config_for_update_with_legacy_store,
+        load_app_config_with_legacy_store, localized_cli_command, receiver_type_from_index,
         receiver_type_index, refresh_existing_installation, remove_directory_tree,
         request_watcher_stop, validate_app_id, validate_receiver_id, wait_for_watcher_exit,
         watcher_stop_requested,
@@ -1880,6 +1899,7 @@ mod cli_tests {
     use crate::paths::AppPaths;
     use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
     use clap::error::ErrorKind;
+    use std::cell::Cell;
     use std::fs;
     use std::thread;
     use std::time::Duration;
@@ -2045,6 +2065,7 @@ mod cli_tests {
         let (_app_home, _codex_home, paths) = paths();
         let feishu = FeishuConfig {
             app_id: "cli_existing".to_owned(),
+            app_secret: "secret_existing".to_owned(),
             receiver_id_type: ReceiverIdType::Email,
             receiver_id: "owner@example.com".to_owned(),
         };
@@ -2056,6 +2077,83 @@ mod cli_tests {
         assert!(summary.contains("重新配置会替换以上飞书设置"));
         assert!(summary.contains("原有通知命令和其他 Hook 不会被删除"));
         assert!(summary.contains("owner@example.com"));
+    }
+
+    #[test]
+    fn legacy_config_is_migrated_to_a_provider_table_with_local_credentials() {
+        let (_app_home, _codex_home, paths) = paths();
+        fs::write(
+            &paths.config,
+            r#"version = 1
+
+[feishu]
+app_id = "cli_legacy"
+receiver_id_type = "email"
+receiver_id = "owner@example.com"
+
+[installation]
+managed_notify = ["codex-notify", "notify"]
+managed_binary_paths = []
+managed_config_paths = []
+codex_config_path = "/tmp/config.toml"
+codex_hooks_path = "/tmp/hooks.json"
+prompt_hook_marker = "codex-notify: record task context"
+stop_hook_marker = "codex-notify: record interruption fallback"
+created_codex_config = false
+created_codex_hooks = false
+"#,
+        )
+        .expect("write legacy config");
+        let pending =
+            load_app_config_for_update_with_legacy_store(
+                &paths,
+                |_| Ok("secret_legacy".to_owned()),
+            )
+            .expect("prepare update migration")
+            .expect("pending config");
+        assert_eq!(
+            pending
+                .config
+                .feishu()
+                .expect("pending Feishu provider")
+                .app_secret,
+            "secret_legacy"
+        );
+        assert!(pending.legacy_feishu.is_some());
+        assert!(
+            fs::read_to_string(&paths.config)
+                .expect("legacy config remains")
+                .contains("version = 1")
+        );
+        assert!(!paths.backups.exists());
+
+        let deleted = Cell::new(false);
+        let migrated = load_app_config_with_legacy_store(
+            &paths,
+            |_| Ok("secret_legacy".to_owned()),
+            |_| {
+                deleted.set(true);
+                Ok(())
+            },
+        )
+        .expect("migrate legacy config")
+        .expect("migrated config");
+
+        assert!(deleted.get());
+        assert_eq!(
+            migrated.feishu().expect("Feishu provider").app_secret,
+            "secret_legacy"
+        );
+        let contents = fs::read_to_string(&paths.config).expect("migrated config");
+        assert!(contents.contains("version = 2"));
+        assert!(contents.contains("[providers.feishu]"));
+        assert!(contents.contains("app_secret = \"secret_legacy\""));
+        assert_eq!(
+            fs::read_dir(&paths.backups)
+                .expect("backup directory")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2107,6 +2205,7 @@ mod cli_tests {
             .expect("initial integration");
         let feishu = FeishuConfig {
             app_id: "cli_update_test".to_owned(),
+            app_secret: "secret_update_test".to_owned(),
             receiver_id_type: ReceiverIdType::Email,
             receiver_id: "owner@example.com".to_owned(),
         };
@@ -2114,13 +2213,12 @@ mod cli_tests {
             .save(&paths)
             .expect("initial app config");
 
-        refresh_existing_installation(&paths, &new_binary, false, false)
-            .expect("refresh integration");
+        refresh_existing_installation(&paths, &new_binary, false).expect("refresh integration");
 
         let updated = AppConfig::load(&paths)
             .expect("load updated config")
             .expect("configured");
-        assert_eq!(updated.feishu, feishu);
+        assert_eq!(updated.feishu().expect("Feishu provider"), &feishu);
         assert_eq!(
             updated.installation.previous_notify,
             Some(vec!["existing-notifier".to_owned(), "--keep".to_owned()])

@@ -104,6 +104,6 @@ codex-notify watch --once
 codex-notify uninstall
 ```
 
-停止后台监听，移除由 `codex-notify` 管理的 Hook、凭据和状态，并恢复已记录配置原有的 notifier。它不会删除 Computer Use 或其他不属于本工具的配置。
+停止后台监听，移除由 `codex-notify` 管理的 Hook、本地配置和状态，并恢复已记录配置原有的 notifier。它不会删除 Computer Use 或其他不属于本工具的配置。
 
 添加 `--yes` 可以跳过卸载确认。

@@ -44,17 +44,16 @@ impl FeishuClient {
         }
     }
 
-    pub fn verify_credentials(&self, config: &FeishuConfig, app_secret: &str) -> Result<()> {
-        self.tenant_access_token(config, app_secret).map(|_| ())
+    pub fn verify_credentials(&self, config: &FeishuConfig) -> Result<()> {
+        self.tenant_access_token(config).map(|_| ())
     }
 
     pub fn send(
         &self,
         config: &FeishuConfig,
-        app_secret: &str,
         notification: &Notification,
     ) -> Result<DeliveryReceipt> {
-        let token = self.tenant_access_token(config, app_secret)?;
+        let token = self.tenant_access_token(config)?;
         let card = render(notification);
         let endpoint = format!(
             "{}/im/v1/messages?receive_id_type={}",
@@ -83,11 +82,11 @@ impl FeishuClient {
         })
     }
 
-    fn tenant_access_token(&self, config: &FeishuConfig, app_secret: &str) -> Result<String> {
+    fn tenant_access_token(&self, config: &FeishuConfig) -> Result<String> {
         let endpoint = format!("{}/auth/v3/tenant_access_token/internal", self.api_base);
         let payload = TenantTokenRequest {
             app_id: &config.app_id,
-            app_secret,
+            app_secret: &config.app_secret,
         };
         let response =
             self.send_with_retry(|| self.client.post(&endpoint).json(&payload).send())?;
@@ -265,13 +264,13 @@ mod tests {
         let client = FeishuClient::with_api_base(format!("http://{address}"));
         let config = FeishuConfig {
             app_id: "cli_test".to_owned(),
+            app_secret: "secret_test".to_owned(),
             receiver_id_type: ReceiverIdType::OpenId,
             receiver_id: "ou_test".to_owned(),
         };
         let receipt = client
             .send(
                 &config,
-                "secret_test",
                 &Notification::completed(
                     "Test conversation",
                     "Test task",

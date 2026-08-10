@@ -29,7 +29,7 @@ features:
   - title: 安全共存
     details: 保留已有 notifier，兼容 Computer Use，也能适应多套 config.toml 切换。
   - title: 本地优先
-    details: 没有中转服务器或遥测；App Secret 只保存在系统凭据库中。
+    details: 没有中转服务器或遥测；消息平台设置和凭据统一保存在当前用户的本地配置文件中。
   - title: 三端支持
     details: 提供 macOS、Windows 和 Linux 独立安装包，不需要 Rust、Python 或 Node.js。
   - title: 随时撤销

@@ -74,4 +74,24 @@ codex-notify init
 codex-notify status
 ```
 
-应用配置、运行状态、日志和备份保存在当前用户的应用数据目录中；App Secret 单独保存在系统凭据库。路径会随操作系统变化，因此建议以 `status` 输出为准。
+应用配置统一保存在用户目录下的 `~/.codex-notify/config.toml`，其中包括 App Secret；运行状态、日志和备份也位于 `~/.codex-notify`。仍建议以 `status` 输出的实际路径为准，因为测试或高级用法可以通过环境变量覆盖目录。
+
+这个文件采用版本化的“命名平台实例”结构。当前初始化生成的主要部分如下；`installation` 表还会记录通知链接入和卸载恢复所需的元数据。
+
+```toml
+version = 2
+
+[providers.feishu]
+type = "feishu"
+enabled = true
+app_id = "cli_example"
+app_secret = "replace-me"
+receiver_id_type = "email"
+receiver_id = "owner@example.com"
+```
+
+`feishu` 是实例 ID，`type` 是平台类型。这个结构为未来的 `[providers.slack]`、`[providers.email]` 以及同一平台的多个账号预留了空间；当前版本仍只发送到一个启用的飞书实例。平台适配器只读取属于自己的字段。
+
+::: warning 配置文件包含明文凭据
+不要把 `~/.codex-notify/config.toml` 提交到仓库、贴到问题报告或放进不受信任的同步目录。Unix 系统上的默认权限为目录 `700`、文件 `600`。
+:::

@@ -8,7 +8,7 @@ pub mod monitor;
 pub mod notify_config;
 pub mod paths;
 pub mod platform;
-pub mod secrets;
+mod secrets;
 pub mod settings;
 pub mod state;
 pub mod transcript;

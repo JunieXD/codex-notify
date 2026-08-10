@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -9,25 +11,43 @@ use toml_edit::ser::to_string_pretty;
 
 use crate::paths::AppPaths;
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
+pub const DEFAULT_FEISHU_PROVIDER_ID: &str = "feishu";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub version: u32,
-    pub feishu: FeishuConfig,
+    pub providers: BTreeMap<String, ProviderConfig>,
     pub installation: InstallationConfig,
 }
 
 impl AppConfig {
     pub fn new(feishu: FeishuConfig, installation: InstallationConfig) -> Self {
+        let providers = BTreeMap::from([(
+            DEFAULT_FEISHU_PROVIDER_ID.to_owned(),
+            ProviderConfig::Feishu {
+                enabled: true,
+                config: feishu,
+            },
+        )]);
         Self {
             version: CONFIG_VERSION,
-            feishu,
+            providers,
             installation,
         }
     }
 
     pub fn load(paths: &AppPaths) -> Result<Option<Self>> {
+        match Self::load_stored(paths)? {
+            Some(StoredConfig::Current(config)) => Ok(Some(config)),
+            Some(StoredConfig::Legacy(_)) => {
+                bail!("检测到旧版 codex-notify 配置，需要先迁移 App Secret")
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn load_stored(paths: &AppPaths) -> Result<Option<StoredConfig>> {
         let contents = match fs::read_to_string(&paths.config) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -35,10 +55,28 @@ impl AppConfig {
                 return Err(error).with_context(|| format!("无法读取 {}", paths.config.display()));
             }
         };
-        let config: Self = from_str(&contents)
-            .with_context(|| format!("无法解析配置文件 {}", paths.config.display()))?;
-        config.validate()?;
-        Ok(Some(config))
+        let version = from_str::<ConfigVersion>(&contents)
+            .with_context(|| format!("无法解析配置文件 {}", paths.config.display()))?
+            .version;
+        match version {
+            CONFIG_VERSION => {
+                let config: Self = from_str(&contents)
+                    .with_context(|| format!("无法解析配置文件 {}", paths.config.display()))?;
+                config.validate()?;
+                Ok(Some(StoredConfig::Current(config)))
+            }
+            1 => {
+                let config: LegacyAppConfig = from_str(&contents)
+                    .with_context(|| format!("无法解析旧版配置文件 {}", paths.config.display()))?;
+                config.validate()?;
+                Ok(Some(StoredConfig::Legacy(config)))
+            }
+            version => bail!(
+                "不支持 codex-notify 配置版本 {}，当前支持的版本是 {}",
+                version,
+                CONFIG_VERSION
+            ),
+        }
     }
 
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
@@ -56,20 +94,184 @@ impl AppConfig {
                 CONFIG_VERSION
             );
         }
-        self.feishu.validate()?;
+        if self.providers.is_empty() {
+            bail!("至少需要配置一个通知平台");
+        }
+        let mut enabled = 0usize;
+        for (id, provider) in &self.providers {
+            if id.trim().is_empty() {
+                bail!("通知平台实例 ID 不能为空");
+            }
+            provider.validate()?;
+            if provider.enabled() {
+                enabled += 1;
+            }
+        }
+        if enabled == 0 {
+            bail!("至少需要启用一个通知平台");
+        }
         self.installation.validate()
+    }
+
+    pub fn feishu(&self) -> Result<&FeishuConfig> {
+        self.providers
+            .values()
+            .find_map(ProviderConfig::enabled_feishu)
+            .context("没有启用的飞书通知配置")
+    }
+
+    pub fn replace_feishu(&mut self, config: FeishuConfig) {
+        let id = self
+            .providers
+            .iter()
+            .find_map(|(id, provider)| provider.is_feishu().then(|| id.clone()))
+            .unwrap_or_else(|| DEFAULT_FEISHU_PROVIDER_ID.to_owned());
+        self.providers.insert(
+            id,
+            ProviderConfig::Feishu {
+                enabled: true,
+                config,
+            },
+        );
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    Feishu {
+        #[serde(default = "default_provider_enabled")]
+        enabled: bool,
+        #[serde(flatten)]
+        config: FeishuConfig,
+    },
+}
+
+impl ProviderConfig {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Feishu { config, .. } => config.validate(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        match self {
+            Self::Feishu { enabled, .. } => *enabled,
+        }
+    }
+
+    fn enabled_feishu(&self) -> Option<&FeishuConfig> {
+        match self {
+            Self::Feishu {
+                enabled: true,
+                config,
+            } => Some(config),
+            Self::Feishu { enabled: false, .. } => None,
+        }
+    }
+
+    fn is_feishu(&self) -> bool {
+        matches!(self, Self::Feishu { .. })
+    }
+}
+
+fn default_provider_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeishuConfig {
+    pub app_id: String,
+    pub app_secret: String,
+    pub receiver_id_type: ReceiverIdType,
+    pub receiver_id: String,
+}
+
+impl fmt::Debug for FeishuConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FeishuConfig")
+            .field("app_id", &self.app_id)
+            .field("app_secret", &"[REDACTED]")
+            .field("receiver_id_type", &self.receiver_id_type)
+            .field("receiver_id", &self.receiver_id)
+            .finish()
+    }
+}
+
+impl FeishuConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.app_id.trim().is_empty() {
+            bail!("飞书 App ID 不能为空");
+        }
+        if self.app_secret.trim().is_empty() {
+            bail!("飞书 App Secret 不能为空");
+        }
+        if self.receiver_id.trim().is_empty() {
+            bail!("飞书接收者 ID 不能为空");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigVersion {
+    version: u32,
+}
+
+#[derive(Debug)]
+pub(crate) enum StoredConfig {
+    Current(AppConfig),
+    Legacy(LegacyAppConfig),
+}
+
+impl StoredConfig {
+    pub fn installation(&self) -> &InstallationConfig {
+        match self {
+            Self::Current(config) => &config.installation,
+            Self::Legacy(config) => &config.installation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct LegacyAppConfig {
+    version: u32,
+    pub feishu: LegacyFeishuConfig,
+    pub installation: InstallationConfig,
+}
+
+impl LegacyAppConfig {
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("旧版配置版本必须是 1");
+        }
+        self.feishu.validate()?;
+        self.installation.validate()
+    }
+
+    pub fn into_current(self, app_secret: String) -> AppConfig {
+        AppConfig::new(
+            FeishuConfig {
+                app_id: self.feishu.app_id,
+                app_secret,
+                receiver_id_type: self.feishu.receiver_id_type,
+                receiver_id: self.feishu.receiver_id,
+            },
+            self.installation,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct LegacyFeishuConfig {
     pub app_id: String,
     pub receiver_id_type: ReceiverIdType,
     pub receiver_id: String,
 }
 
-impl FeishuConfig {
-    pub fn validate(&self) -> Result<()> {
+impl LegacyFeishuConfig {
+    fn validate(&self) -> Result<()> {
         if self.app_id.trim().is_empty() {
             bail!("飞书 App ID 不能为空");
         }
@@ -195,7 +397,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn config_round_trip_does_not_contain_the_app_secret() {
+    fn config_round_trip_keeps_provider_credentials_in_the_toml_file() {
         let app_home = tempdir().expect("temporary app home");
         let codex_home = tempdir().expect("temporary Codex home");
         let paths = AppPaths {
@@ -209,6 +411,7 @@ mod tests {
         let config = AppConfig::new(
             FeishuConfig {
                 app_id: "cli_test_123".to_owned(),
+                app_secret: "secret_test_123".to_owned(),
                 receiver_id_type: ReceiverIdType::OpenId,
                 receiver_id: "ou_test".to_owned(),
             },
@@ -228,8 +431,67 @@ mod tests {
 
         config.save(&paths).expect("save config");
         let contents = std::fs::read_to_string(&paths.config).expect("read config");
-        assert!(!contents.contains("app_secret"));
+        assert!(contents.contains("[providers.feishu]"));
+        assert!(contents.contains("type = \"feishu\""));
+        assert!(contents.contains("app_secret = \"secret_test_123\""));
+        assert!(!format!("{config:?}").contains("secret_test_123"));
         assert_eq!(AppConfig::load(&paths).expect("load config"), Some(config));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_readable_only_by_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_home = tempdir().expect("temporary app home");
+        let codex_home = tempdir().expect("temporary Codex home");
+        let paths = AppPaths {
+            root: app_home.path().to_path_buf(),
+            config: app_home.path().join("config.toml"),
+            state: app_home.path().join("state"),
+            logs: app_home.path().join("logs"),
+            backups: app_home.path().join("backups"),
+            codex_home: codex_home.path().to_path_buf(),
+        };
+        let config = AppConfig::new(
+            FeishuConfig {
+                app_id: "cli_test_permissions".to_owned(),
+                app_secret: "secret_permissions".to_owned(),
+                receiver_id_type: ReceiverIdType::Email,
+                receiver_id: "test@example.com".to_owned(),
+            },
+            InstallationConfig {
+                previous_notify: None,
+                managed_notify: vec!["codex-notify".to_owned(), "notify".to_owned()],
+                managed_binary_paths: Vec::new(),
+                managed_config_paths: Vec::new(),
+                codex_config_path: "/tmp/config.toml".to_owned(),
+                codex_hooks_path: "/tmp/hooks.json".to_owned(),
+                prompt_hook_marker: "codex-notify: record task context".to_owned(),
+                stop_hook_marker: "codex-notify: record interruption fallback".to_owned(),
+                created_codex_config: false,
+                created_codex_hooks: false,
+            },
+        );
+
+        config.save(&paths).expect("save config");
+
+        assert_eq!(
+            std::fs::metadata(&paths.config)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.root)
+                .expect("root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]

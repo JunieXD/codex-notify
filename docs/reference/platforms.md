@@ -26,7 +26,7 @@ description: codex-notify 支持的操作系统、处理器架构和后台启动
 
 ## macOS
 
-支持 Apple Silicon 和 Intel。App Secret 保存在系统钥匙串，后台 watcher 使用当前用户的 LaunchAgent 登录自启。
+支持 Apple Silicon 和 Intel。配置与 App Secret 保存在 `~/.codex-notify/config.toml`，后台 watcher 使用当前用户的 LaunchAgent 登录自启。
 
 如果系统首次运行下载的程序时弹出安全提示，请确认文件来自项目 GitHub Release，并按照 macOS 提示允许运行。
 
@@ -34,7 +34,7 @@ description: codex-notify 支持的操作系统、处理器架构和后台启动
 
 ## Windows
 
-支持 x64 Windows 10/11。App Secret 保存在 Windows 凭据管理器，watcher 使用当前用户登录启动项，不写入系统级服务。
+支持 x64 Windows 10/11。配置与 App Secret 保存在用户目录下的 `.codex-notify/config.toml`，watcher 使用当前用户登录启动项，不写入系统级服务。
 
 安装后若找不到 `codex-notify`，请按照安装脚本提示把安装目录加入用户 `PATH`，再重新打开 PowerShell。
 
@@ -43,7 +43,6 @@ description: codex-notify 支持的操作系统、处理器架构和后台启动
 支持 ARM64 和 x64，要求：
 
 - 使用 systemd 用户会话；
-- 桌面 Secret Service 可用，例如 GNOME Keyring；
 - 系统包含常见的 glibc 运行环境。
 
-Ubuntu 桌面通常已经满足这些条件。纯服务器环境可能没有 Secret Service，因此当前更适合带桌面会话的 Linux 系统。
+Ubuntu 桌面通常已经满足这些条件。由于凭据现在保存在本地配置文件中，不再要求 GNOME Keyring 或其他 Secret Service。

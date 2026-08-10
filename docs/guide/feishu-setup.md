@@ -66,7 +66,7 @@ description: 面向第一次使用飞书机器人的用户，从零创建企业�
 2. 复制 App ID，它通常以 `cli_` 开头。
 3. 点击查看并复制 App Secret。请像保管密码一样保管它，不要发到聊天、截图或写入公开文件。
 
-初始化时 App Secret 的输入内容会隐藏。`codex-notify` 会将它保存到 macOS 钥匙串、Windows 凭据管理器或 Linux Secret Service，不会明文写入配置文件。
+初始化时 App Secret 的输入内容会隐藏。`codex-notify` 会将它明文保存到 `~/.codex-notify/config.toml`；在 Unix 系统上，该目录和文件分别限制为仅当前用户可访问的 `700` 和 `600` 权限。不要提交或分享这个文件。
 
 ## 6. 选择通知接收者
 
