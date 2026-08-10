@@ -1548,6 +1548,18 @@ mod cli_tests {
         assert!(codex_config.contains("existing-notifier"));
         assert!(codex_config.contains(new_binary.to_string_lossy().as_ref()));
         let hooks = fs::read_to_string(paths.codex_hooks()).expect("Codex hooks");
-        assert!(hooks.contains(new_binary.to_string_lossy().as_ref()));
+        let hooks: serde_json::Value = serde_json::from_str(&hooks).expect("parse Codex hooks");
+        let expected_binary = new_binary.to_string_lossy();
+        for event in ["UserPromptSubmit", "Stop"] {
+            let handler = &hooks["hooks"][event][0]["hooks"][0];
+            for command_field in ["command", "commandWindows"] {
+                assert!(
+                    handler[command_field]
+                        .as_str()
+                        .expect("hook command")
+                        .contains(expected_binary.as_ref())
+                );
+            }
+        }
     }
 }
