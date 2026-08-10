@@ -149,6 +149,17 @@ pub fn watcher_location() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn bootout_macos_watcher(domain: &str, plist_path: &Path) -> std::io::Result<std::process::Output> {
+    // `launchctl bootout` reports an error when the agent is already unloaded.
+    // That is an expected, idempotent state during upgrades, so capture the
+    // command output instead of leaking a misleading raw system error.
+    Command::new("/bin/launchctl")
+        .args(["bootout", domain])
+        .arg(plist_path)
+        .output()
+}
+
+#[cfg(target_os = "macos")]
 fn install_macos_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
     let plist_path = macos_plist_path()?;
     let previous = fs::read(&plist_path).ok();
@@ -163,9 +174,7 @@ fn install_macos_watcher(paths: &AppPaths, binary: &Path) -> Result<()> {
 
     let uid = current_uid()?;
     let domain = format!("gui/{uid}");
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &domain, &plist_path.display().to_string()])
-        .status();
+    let _ = bootout_macos_watcher(&domain, &plist_path);
     let status = Command::new("/bin/launchctl")
         .args(["bootstrap", &domain, &plist_path.display().to_string()])
         .status()
@@ -197,9 +206,7 @@ fn uninstall_macos_watcher() -> Result<()> {
     }
     let uid = current_uid()?;
     let domain = format!("gui/{uid}");
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &domain, &plist_path.display().to_string()])
-        .status();
+    let _ = bootout_macos_watcher(&domain, &plist_path);
     fs::remove_file(&plist_path).with_context(|| format!("无法删除 {}", plist_path.display()))?;
     Ok(())
 }
@@ -218,10 +225,7 @@ fn stop_macos_watcher() -> Result<()> {
     }
     let uid = current_uid()?;
     let domain = format!("gui/{uid}");
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &domain, &plist_path.display().to_string()])
-        .status()
-        .context("无法运行 launchctl bootout")?;
+    let _ = bootout_macos_watcher(&domain, &plist_path).context("无法运行 launchctl bootout")?;
     Ok(())
 }
 
@@ -643,6 +647,8 @@ mod tests {
         LINUX_UNIT_MARKER, is_managed_linux_unit, is_managed_windows_run_command, linux_unit,
         macos_plist, windows_run_command,
     };
+    #[cfg(target_os = "macos")]
+    use super::{bootout_macos_watcher, current_uid};
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
@@ -657,6 +663,19 @@ mod tests {
         assert!(plist.contains("<string>com.codex-notify.watcher</string>"));
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
         assert!(plist.contains("<string>watch</string>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bootout_captures_the_expected_already_unloaded_error() {
+        let directory = tempdir().expect("temporary directory");
+        let missing_plist = directory.path().join("missing.plist");
+        let domain = format!("gui/{}", current_uid().expect("current uid"));
+
+        let output = bootout_macos_watcher(&domain, &missing_plist).expect("run launchctl");
+
+        assert!(!output.status.success());
+        assert!(!output.stdout.is_empty() || !output.stderr.is_empty());
     }
 
     #[test]
