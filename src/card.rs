@@ -42,8 +42,55 @@ fn normalize_text(value: &str) -> String {
     if trimmed.is_empty() {
         "\u{672a}\u{547d}\u{540d}".to_owned()
     } else {
-        trimmed.to_owned()
+        replace_markdown_media(trimmed)
     }
+}
+
+fn replace_markdown_media(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = remaining.find("![") {
+        output.push_str(&remaining[..start]);
+        let image = &remaining[start..];
+        let Some(label_end) = image[2..].find("](").map(|index| index + 2) else {
+            output.push_str(image);
+            return output;
+        };
+        let destination_start = label_end + 2;
+        let Some(destination_end) = markdown_destination_end(image, destination_start) else {
+            output.push_str(image);
+            return output;
+        };
+        let label = image[2..label_end].trim();
+        let label = if label.is_empty() {
+            "媒体文件"
+        } else {
+            label
+        };
+        output.push_str(&format!("附件：{label}（请在 Codex 中查看）"));
+        remaining = &image[destination_end + 1..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn markdown_destination_end(value: &str, start: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut escaped = false;
+    for (offset, character) in value[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '(' => depth = depth.saturating_add(1),
+            ')' if depth == 0 => return Some(start + offset),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn outer_title(notification: &Notification, moment: &DateTime<Local>) -> String {
@@ -298,6 +345,26 @@ mod tests {
         let card = render(&notification);
         assert!(card.serialized_content.len() <= MAX_CARD_CONTENT_BYTES);
         assert!(serde_json::from_str::<serde_json::Value>(&card.serialized_content).is_ok());
+    }
+
+    #[test]
+    fn local_markdown_media_is_rendered_as_a_safe_attachment_note() {
+        let mut notification = completion();
+        notification.details_markdown = concat!(
+            "成片：\n\n",
+            "![宣传片](/Users/example/video/demo.mp4)\n\n",
+            "![预览](</Users/example/video/preview (final).png>)"
+        )
+        .to_owned();
+        let card = render(&notification);
+        let markdown = card.value["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("markdown content");
+
+        assert!(markdown.contains("附件：宣传片（请在 Codex 中查看）"));
+        assert!(markdown.contains("附件：预览（请在 Codex 中查看）"));
+        assert!(!markdown.contains("!["));
+        assert!(!markdown.contains("/Users/example"));
     }
 
     #[test]

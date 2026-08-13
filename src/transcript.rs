@@ -17,6 +17,7 @@ const KNOWN_USAGE_LIMIT_MESSAGES: &[&str] = &[
     "you have reached your usage limit. please try again later.",
     "you've reached your usage limit. please try again later.",
 ];
+const ABORTED_TURN_MESSAGE: &str = "任务在收到最终完成消息前中断。请打开 Codex 查看详情。";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptEvent {
@@ -263,6 +264,7 @@ fn event_message(payload: &serde_json::Map<String, Value>) -> Vec<TranscriptEven
             Some(error) => vec![TranscriptEventKind::TerminalError(error)],
             None => vec![TranscriptEventKind::TaskCompleted(task_completion(payload))],
         },
+        Some("turn_aborted") => vec![TranscriptEventKind::TerminalError(aborted_turn(payload))],
         _ => Vec::new(),
     }
 }
@@ -300,6 +302,24 @@ fn terminal_error(payload: &serde_json::Map<String, Value>) -> Option<TerminalEr
             .and_then(Value::as_u64)
             .map(|milliseconds| milliseconds / 1_000),
     })
+}
+
+fn aborted_turn(payload: &serde_json::Map<String, Value>) -> TerminalError {
+    let reason = string_field(payload, "reason").unwrap_or_default();
+    let message = if reason.is_empty() || reason.eq_ignore_ascii_case("interrupted") {
+        ABORTED_TURN_MESSAGE.to_owned()
+    } else {
+        format!("{ABORTED_TURN_MESSAGE}（原因：{reason}）")
+    };
+    TerminalError {
+        turn_id: string_field(payload, "turn_id").unwrap_or_default(),
+        message,
+        completed_at_seconds: number_seconds(payload.get("completed_at")),
+        duration_seconds: payload
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .map(|milliseconds| milliseconds / 1_000),
+    }
 }
 
 fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -389,6 +409,27 @@ mod tests {
             &event.kind,
             TranscriptEventKind::TerminalError(error)
                 if error.message.contains("\u{4f7f}\u{7528}\u{4e0a}\u{9650}")
+        )));
+    }
+
+    #[test]
+    fn recognizes_an_aborted_turn_without_a_task_complete_error() {
+        let directory = tempdir().expect("temporary directory");
+        let transcript = directory.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"turn-aborted\",\"reason\":\"interrupted\",\"completed_at\":100,\"duration_ms\":305798}}\n",
+        )
+        .expect("write transcript");
+
+        let result = read_events_from(&transcript, 0).expect("read transcript");
+        assert!(result.events.iter().any(|event| matches!(
+            &event.kind,
+            TranscriptEventKind::TerminalError(error)
+                if error.turn_id == "turn-aborted"
+                    && error.message.contains("最终完成消息前中断")
+                    && error.completed_at_seconds == Some(100)
+                    && error.duration_seconds == Some(305)
         )));
     }
 

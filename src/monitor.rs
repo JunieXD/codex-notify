@@ -1356,6 +1356,14 @@ mod tests {
         )
     }
 
+    fn transcript_with_aborted_turn(now_seconds: u64) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\",\"cwd\":\"/workspace\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"internal_chat_message_metadata_passthrough\":{{\"turn_id\":\"turn-aborted\"}},\"content\":[{{\"type\":\"input_text\",\"text\":\"Render the video\"}}]}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"turn_id\":\"turn-aborted\",\"reason\":\"interrupted\",\"completed_at\":{now_seconds},\"duration_ms\":305798}}}}\n"
+        )
+    }
+
     fn completion_event(turn_id: &str) -> CompletionEvent {
         CompletionEvent {
             event_type: "agent-turn-complete".to_owned(),
@@ -1676,6 +1684,34 @@ mod tests {
                 .notification
                 .details_markdown
                 .contains("\u{4f7f}\u{7528}\u{4e0a}\u{9650}")
+        );
+    }
+
+    #[test]
+    fn aborted_turn_with_progress_messages_reaches_the_interruption_flow() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(&transcript, transcript_with_aborted_turn(seconds)).expect("write transcript");
+
+        let (summary, first) = prepare_notifications(&paths, now).expect("first scan");
+        assert_eq!(summary.new_candidates, 1);
+        assert!(first.is_empty());
+        let (_, deliveries) = prepare_notifications(&paths, now + Duration::from_secs(31))
+            .expect("confirmed aborted turn scan");
+
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].notification.outcome, Outcome::Interrupted);
+        assert_eq!(deliveries[0].notification.task, "Render the video");
+        assert!(
+            deliveries[0]
+                .notification
+                .details_markdown
+                .contains("最终完成消息前中断")
+        );
+        assert_eq!(
+            deliveries[0].notification.elapsed,
+            Some(Duration::from_secs(305))
         );
     }
 

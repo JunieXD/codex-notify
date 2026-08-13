@@ -231,9 +231,10 @@ Color:             green
 ```
 
 The task and result are collapsed by default. Markdown is preserved where the
-destination supports it. The tool must account for the serialized card size,
-not merely raw source-text byte count, and truncate only when necessary to fit
-Feishu limits.
+destination supports it. Local Markdown media embeds are replaced with a text
+attachment note because a filesystem path is not a valid Feishu image key. The
+tool must account for the serialized card size, not merely raw source-text byte
+count, and truncate only when necessary to fit Feishu limits.
 
 ### 6.4 Interruption card
 
@@ -315,8 +316,9 @@ emits only completion events.
 The watcher reads only recent Codex session transcript files and tracks byte
 offsets. On a state-schema upgrade it performs a bounded ten-minute lookback,
 seeding previous documented completions as delivered so the migration does not
-duplicate cards. It watches terminal `task_complete` records with an error
-message, including examples such as:
+duplicate cards. It watches terminal `task_complete` records with an error and
+`turn_aborted` records that did not produce a final completion message,
+including examples such as:
 
 - Stream disconnects and transport failures.
 - Provider or proxy failures.
