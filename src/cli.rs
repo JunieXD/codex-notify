@@ -1241,7 +1241,7 @@ fn stop_hook() -> Result<()> {
         .read_to_string(&mut input)
         .context("无法读取 Codex Stop Hook 输入")?;
     match serde_json::from_str::<StopHookEvent>(&input) {
-        Ok(event) if event.last_assistant_message.trim().is_empty() => {
+        Ok(event) if should_record_stop_fallback(&event) => {
             let transcript_path = (!event.transcript_path.trim().is_empty())
                 .then(|| PathBuf::from(event.transcript_path));
             if monitor::record_stop_fallback(
@@ -1262,6 +1262,10 @@ fn stop_hook() -> Result<()> {
     }
     println!("{{}}");
     Ok(())
+}
+
+fn should_record_stop_fallback(event: &StopHookEvent) -> bool {
+    !event.turn_id.trim().is_empty()
 }
 
 fn watch(arguments: WatchArgs) -> Result<()> {
@@ -1960,6 +1964,8 @@ mod cli_tests {
         request_watcher_stop, validate_app_id, validate_receiver_id, wait_for_watcher_exit,
         watcher_stop_requested,
     };
+    use crate::cli::should_record_stop_fallback;
+    use crate::codex::StopHookEvent;
     use crate::paths::AppPaths;
     use crate::settings::{AppConfig, FeishuConfig, ReceiverIdType};
     use clap::error::ErrorKind;
@@ -2033,6 +2039,18 @@ mod cli_tests {
         assert!(HOOK_TRUST_GUIDANCE.contains("“用户”区域"));
         assert!(HOOK_TRUST_GUIDANCE.contains("UserPromptSubmit"));
         assert!(HOOK_TRUST_GUIDANCE.contains("Stop"));
+    }
+
+    #[test]
+    fn stop_hook_records_turns_even_when_progress_text_exists() {
+        let event = StopHookEvent {
+            turn_id: "turn-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            cwd: "/workspace".to_owned(),
+            transcript_path: "/tmp/session.jsonl".to_owned(),
+            last_assistant_message: "已有进度，但任务因用量上限停止".to_owned(),
+        };
+        assert!(should_record_stop_fallback(&event));
     }
 
     #[test]
