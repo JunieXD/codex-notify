@@ -42,6 +42,16 @@ codex-notify test
 
 使用当前配置发送一条飞书测试卡片。它适合确认 App ID、App Secret、权限和接收者是否都能正常工作。
 
+## `config`：修改通知范围
+
+```sh
+codex-notify config
+codex-notify config --subagent-notifications on
+codex-notify config --subagent-notifications off
+```
+
+不带选项时显示当前通知范围。subAgent（侧边会话）默认不推送；只有显式设为 `on` 才会推送。后台 watcher 会自动加载修改，无需重启。
+
 ## `status`：查看状态
 
 ```sh

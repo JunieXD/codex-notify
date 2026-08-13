@@ -81,6 +81,9 @@ codex-notify status
 ```toml
 version = 2
 
+[notifications]
+include_subagents = false
+
 [providers.feishu]
 type = "feishu"
 enabled = true
@@ -89,6 +92,8 @@ app_secret = "replace-me"
 receiver_id_type = "email"
 receiver_id = "owner@example.com"
 ```
+
+`include_subagents = false` 会排除 subAgent/侧边会话的完成与中断通知，这是默认行为。可以通过 `codex-notify config --subagent-notifications on` 显式开启，或使用 `off` 恢复默认过滤。
 
 `feishu` 是实例 ID，`type` 是平台类型。这个结构为未来的 `[providers.slack]`、`[providers.email]` 以及同一平台的多个账号预留了空间；当前版本仍只发送到一个启用的飞书实例。平台适配器只读取属于自己的字段。
 

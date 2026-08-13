@@ -17,6 +17,8 @@ pub const DEFAULT_FEISHU_PROVIDER_ID: &str = "feishu";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub version: u32,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub installation: InstallationConfig,
 }
@@ -32,6 +34,7 @@ impl AppConfig {
         )]);
         Self {
             version: CONFIG_VERSION,
+            notifications: NotificationConfig::default(),
             providers,
             installation,
         }
@@ -134,6 +137,13 @@ impl AppConfig {
             },
         );
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationConfig {
+    /// Subagent/side-thread transcripts are excluded unless explicitly enabled.
+    #[serde(default)]
+    pub include_subagents: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,8 +444,36 @@ mod tests {
         assert!(contents.contains("[providers.feishu]"));
         assert!(contents.contains("type = \"feishu\""));
         assert!(contents.contains("app_secret = \"secret_test_123\""));
+        assert!(contents.contains("[notifications]"));
+        assert!(contents.contains("include_subagents = false"));
         assert!(!format!("{config:?}").contains("secret_test_123"));
         assert_eq!(AppConfig::load(&paths).expect("load config"), Some(config));
+    }
+
+    #[test]
+    fn existing_version_two_config_defaults_to_excluding_subagents() {
+        let config: AppConfig = toml_edit::de::from_str(
+            r#"
+version = 2
+
+[providers.feishu]
+type = "feishu"
+enabled = true
+app_id = "cli_existing"
+app_secret = "secret_existing"
+receiver_id_type = "email"
+receiver_id = "owner@example.com"
+
+[installation]
+managed_notify = ["codex-notify", "notify"]
+codex_config_path = "/tmp/config.toml"
+codex_hooks_path = "/tmp/hooks.json"
+prompt_hook_marker = "codex-notify: record task context"
+"#,
+        )
+        .expect("parse existing version two config");
+
+        assert!(!config.notifications.include_subagents);
     }
 
     #[cfg(unix)]

@@ -7,6 +7,18 @@ description: 了解完成通知、中断通知及其边界。
 
 `codex-notify` 发送两类飞书卡片：任务正常完成，以及任务确认中断。
 
+## subAgent 与侧边会话
+
+subAgent（界面中的侧边会话）有独立的本地 rollout 记录。`codex-notify` 会读取首条 `session_meta` 的 `thread_source` 精确区分它与用户主会话；默认过滤这些侧边会话的完成和中断通知，只推送主会话。
+
+如确实需要接收侧边会话通知，可以显式开启：
+
+```sh
+codex-notify config --subagent-notifications on
+```
+
+使用 `off` 可恢复默认过滤。这个开关只影响 `codex-notify` 发往飞书的消息，不会隐藏或删除 Codex 中的任何会话。
+
 ## 完成通知
 
 Codex 正常结束一轮任务后，会通过 `notify` 调用 `codex-notify`。完成事件会先进入本地队列，再由后台 watcher 发送。飞书卡片包含：

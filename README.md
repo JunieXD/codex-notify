@@ -82,6 +82,7 @@ codex-notify doctor
 | --- | --- |
 | `codex-notify init` | 配置飞书并接入 Codex |
 | `codex-notify test` | 发送一条测试通知 |
+| `codex-notify config` | 查看或修改通知范围（默认不推送 subAgent/侧边会话） |
 | `codex-notify status` | 查看安装和配置状态 |
 | `codex-notify doctor` | 检查常见配置问题 |
 | `codex-notify sync` | 立即同步当前 `config.toml` 的通知链 |

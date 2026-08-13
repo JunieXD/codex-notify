@@ -39,6 +39,7 @@ pub enum TranscriptEventKind {
 pub struct SessionMeta {
     pub session_id: String,
     pub cwd: String,
+    pub thread_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +211,16 @@ fn session_meta(payload: &serde_json::Map<String, Value>) -> SessionMeta {
             .or_else(|| string_field(payload, "session_id"))
             .unwrap_or_default(),
         cwd: string_field(payload, "cwd").unwrap_or_default(),
+        thread_source: string_field(payload, "thread_source")
+            .map(normalized)
+            .or_else(|| {
+                payload
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .is_some_and(|source| source.contains_key("subagent"))
+                    .then(|| "subagent".to_owned())
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -452,6 +463,32 @@ mod tests {
                     && completion.completed_at_seconds == Some(101)
                     && completion.duration_seconds == Some(5)
         )));
+    }
+
+    #[test]
+    fn reads_subagent_rollout_source_from_documented_and_structured_metadata() {
+        let directory = tempdir().expect("temporary directory");
+        let transcript = directory.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"side-1\",\"thread_source\":\"subagent\"}}\n",
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"side-2\",\"source\":{\"subagent\":{\"other\":\"guardian\"}}}}\n"
+            ),
+        )
+        .expect("write subagent metadata");
+
+        let result = read_events_from(&transcript, 0).expect("read metadata");
+        let sources = result
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TranscriptEventKind::SessionMeta(meta) => Some(meta.thread_source.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources, vec!["subagent", "subagent"]);
     }
 
     #[test]

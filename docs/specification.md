@@ -434,6 +434,9 @@ dispatcher uses one enabled Feishu instance.
 ```toml
 version = 2
 
+[notifications]
+include_subagents = false
+
 [providers.feishu]
 type = "feishu"
 enabled = true
@@ -442,6 +445,8 @@ app_secret = "replace-me"
 receiver_id_type = "email"
 receiver_id = "owner@example.com"
 ```
+
+Rollouts whose first `session_meta.thread_source` is `subagent` are excluded from completion and interruption delivery by default. The setting may explicitly opt into those side-thread notifications; missing settings retain the safe default of `false`.
 
 ## 11. Local File Layout
 

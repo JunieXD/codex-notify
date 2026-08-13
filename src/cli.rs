@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::error::{ContextKind, ErrorKind};
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt;
 use serde_json::json;
@@ -47,6 +47,8 @@ enum Commands {
     Init(InitArgs),
     /// 使用当前配置发送一条飞书测试通知。
     Test,
+    /// 查看或修改任务通知范围。
+    Config(ConfigArgs),
     /// 查看本机配置和运行状态，不会显示密钥。
     Status(JsonOutput),
     /// 检查 Codex 与飞书配置并给出处理建议。
@@ -110,6 +112,25 @@ struct JsonOutput {
     /// 输出便于程序读取的 JSON。
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    /// 是否推送 subAgent/侧边会话：on 或 off（默认 off）。
+    #[arg(long, value_enum, hide_possible_values = true, value_name = "on|off")]
+    subagent_notifications: Option<SwitchValue>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SwitchValue {
+    On,
+    Off,
+}
+
+impl SwitchValue {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -206,6 +227,7 @@ pub fn run() -> ExitCode {
     let result = match cli.command {
         Commands::Init(arguments) => init(arguments),
         Commands::Test => send_test(),
+        Commands::Config(arguments) => configure(arguments),
         Commands::Status(arguments) => status(arguments.json),
         Commands::Doctor(arguments) => doctor(arguments.json),
         Commands::Sync => sync(),
@@ -347,6 +369,7 @@ fn localized_usage(command_name: &str) -> Option<&'static str> {
         "codex-notify" => Some("codex-notify <命令>"),
         "init" => Some("codex-notify init [选项]"),
         "test" => Some("codex-notify test"),
+        "config" => Some("codex-notify config [选项]"),
         "status" => Some("codex-notify status [选项]"),
         "doctor" => Some("codex-notify doctor [选项]"),
         "sync" => Some("codex-notify sync"),
@@ -355,6 +378,30 @@ fn localized_usage(command_name: &str) -> Option<&'static str> {
         "watch" => Some("codex-notify watch [选项]"),
         _ => None,
     }
+}
+
+fn configure(arguments: ConfigArgs) -> Result<()> {
+    let paths = AppPaths::discover()?;
+    let mut config = configured(&paths)?;
+    if let Some(value) = arguments.subagent_notifications {
+        config.notifications.include_subagents = value.enabled();
+        config.save(&paths)?;
+        println!(
+            "subAgent/侧边会话通知已{}；后台监听会自动应用新设置。",
+            if value.enabled() { "开启" } else { "关闭" }
+        );
+    } else {
+        println!(
+            "subAgent/侧边会话通知：{}",
+            if config.notifications.include_subagents {
+                "开启"
+            } else {
+                "关闭（默认）"
+            }
+        );
+        println!("修改方式：codex-notify config --subagent-notifications <on|off>");
+    }
+    Ok(())
 }
 
 fn init(arguments: InitArgs) -> Result<()> {
@@ -978,6 +1025,8 @@ fn inspection(paths: &AppPaths, config: Option<&AppConfig>) -> Result<serde_json
         "stop_hook_installed": stop_hook_status,
         "background_watcher_installed": watcher_status,
         "watch_interval_seconds": monitor::WATCH_INTERVAL.as_secs(),
+        "subagent_notifications_enabled": config
+            .is_some_and(|config| config.notifications.include_subagents),
         "feishu_receiver_id_type": config
             .and_then(|config| config.feishu().ok())
             .map(|config| config.receiver_id_type.as_api_value()),
@@ -1002,6 +1051,9 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     let watcher = data["background_watcher_installed"]
         .as_bool()
         .unwrap_or(false);
+    let subagent_notifications = data["subagent_notifications_enabled"]
+        .as_bool()
+        .unwrap_or(false);
     println!("codex-notify 状态");
     println!("-----------------");
     println!("配置状态：{}", if configured { "已完成" } else { "未配置" });
@@ -1014,6 +1066,14 @@ fn print_inspection(data: &serde_json::Value, json_output: bool, include_guidanc
     println!("UserPromptSubmit Hook：{}", installed_status(hook));
     println!("Stop Hook：{}", installed_status(stop_hook));
     println!("后台监听：{}", installed_status(watcher));
+    println!(
+        "subAgent/侧边会话通知：{}",
+        if subagent_notifications {
+            "开启"
+        } else {
+            "关闭（默认）"
+        }
+    );
 
     if !include_guidance {
         return;
@@ -1296,7 +1356,11 @@ fn reconcile_active_config(
 }
 
 fn watch_once(paths: &AppPaths, config: &AppConfig) -> Result<usize> {
-    let (_, deliveries) = monitor::prepare_notifications(paths, SystemTime::now())?;
+    let (_, deliveries) = monitor::prepare_notifications_with_subagents(
+        paths,
+        SystemTime::now(),
+        config.notifications.include_subagents,
+    )?;
     if deliveries.is_empty() {
         return Ok(0);
     }
@@ -2004,6 +2068,7 @@ mod cli_tests {
         for name in [
             "init",
             "test",
+            "config",
             "status",
             "doctor",
             "sync",
@@ -2058,6 +2123,10 @@ mod cli_tests {
             .to_string();
         assert!(update_help.contains("--proxy <URL>"));
         assert!(update_help.contains("--no-proxy"));
+
+        localized_cli_command()
+            .try_get_matches_from(["codex-notify", "config", "--subagent-notifications", "off"])
+            .expect("subagent notification switch");
     }
 
     #[test]

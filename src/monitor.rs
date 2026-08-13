@@ -36,7 +36,7 @@ const MAX_PENDING_COMPLETIONS: usize = 256;
 const MAX_CONFIRMING: usize = 128;
 const MAX_PROMPTS_PER_FILE: usize = 128;
 const DELIVERY_LEASE: Duration = Duration::from_secs(60);
-const MONITOR_STATE_VERSION: u32 = 1;
+const MONITOR_STATE_VERSION: u32 = 2;
 const GOAL_FAILURE_STATUSES: &[&str] = &["blocked", "usage_limited", "budget_limited"];
 const GOAL_STOP_STATUSES: &[&str] = &["paused", "complete"];
 
@@ -53,6 +53,7 @@ pub struct WatchSummary {
     pub new_candidates: usize,
     pub canceled_candidates: usize,
     pub pending_deliveries: usize,
+    pub filtered_subagents: usize,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -86,6 +87,8 @@ struct FileCursor {
     #[serde(default)]
     cwd: String,
     #[serde(default)]
+    thread_source: String,
+    #[serde(default)]
     prompts: Vec<PromptSnapshot>,
 }
 
@@ -112,6 +115,8 @@ struct CompletionCandidate {
     cwd: String,
     #[serde(default)]
     conversation_title: String,
+    #[serde(default)]
+    thread_source: String,
     #[serde(default)]
     duration_seconds: Option<u64>,
     #[serde(default)]
@@ -145,6 +150,8 @@ struct Candidate {
     #[serde(default)]
     conversation_title: String,
     #[serde(default)]
+    thread_source: String,
+    #[serde(default)]
     duration_seconds: Option<u64>,
     detected_at_seconds: u64,
     #[serde(default)]
@@ -169,6 +176,14 @@ struct Candidate {
 pub fn prepare_notifications(
     paths: &AppPaths,
     now: SystemTime,
+) -> Result<(WatchSummary, Vec<PendingDelivery>)> {
+    prepare_notifications_with_subagents(paths, now, false)
+}
+
+pub fn prepare_notifications_with_subagents(
+    paths: &AppPaths,
+    now: SystemTime,
+    include_subagents: bool,
 ) -> Result<(WatchSummary, Vec<PendingDelivery>)> {
     let now_seconds = unix_seconds(now);
     with_state(paths, |state, first_run| {
@@ -199,6 +214,10 @@ pub fn prepare_notifications(
         }
         state.files.retain(|path, _| active_paths.contains(path));
         apply_stop_hook_goal_context(state);
+        classify_unattributed_candidates(state);
+        if !include_subagents {
+            filter_subagent_candidates(state, &mut summary);
+        }
 
         let mut deliveries = prepare_completion_deliveries(paths, state, now_seconds)?;
         deliveries.extend(confirm_candidates(
@@ -354,6 +373,7 @@ pub fn record_stop_fallback(
             cwd: candidate_cwd,
             thread_id,
             conversation_title,
+            thread_source: String::new(),
             duration_seconds: None,
             detected_at_seconds: now_seconds,
             active_goal: false,
@@ -416,6 +436,11 @@ fn scan_file(
                 }
                 if !meta.cwd.is_empty() {
                     cursor.cwd = meta.cwd;
+                }
+                // A forked rollout can embed parent session metadata later in
+                // the file. The first source describes the rollout itself.
+                if cursor.thread_source.is_empty() && !meta.thread_source.is_empty() {
+                    cursor.thread_source = meta.thread_source;
                 }
             }
             TranscriptEventKind::UserPrompt(prompt) => {
@@ -531,6 +556,7 @@ fn completion_from_event(
         ),
         cwd,
         conversation_title,
+        String::new(),
         duration_seconds,
         None,
         now_seconds,
@@ -591,6 +617,7 @@ fn completion_from_transcript(
         ),
         cwd,
         conversation_title,
+        cursor.thread_source.clone(),
         completion.duration_seconds,
         completion.completed_at_seconds,
         now_seconds,
@@ -605,6 +632,7 @@ fn completion_candidate(
     details: String,
     cwd: String,
     conversation_title: String,
+    thread_source: String,
     duration_seconds: Option<u64>,
     completed_at_seconds: Option<u64>,
     now_seconds: u64,
@@ -624,6 +652,7 @@ fn completion_candidate(
         details,
         cwd,
         conversation_title,
+        thread_source,
         duration_seconds,
         completed_at_seconds,
         detected_at_seconds: now_seconds,
@@ -661,6 +690,7 @@ fn merge_completion_candidate(existing: &mut CompletionCandidate, incoming: Comp
         &mut existing.conversation_title,
         incoming.conversation_title,
     );
+    replace_if_nonempty(&mut existing.thread_source, incoming.thread_source);
     existing.duration_seconds = incoming.duration_seconds.or(existing.duration_seconds);
     existing.completed_at_seconds = incoming
         .completed_at_seconds
@@ -747,6 +777,7 @@ fn candidate_from_error(
         cwd,
         thread_id,
         conversation_title,
+        thread_source: cursor.thread_source.clone(),
         duration_seconds: error.duration_seconds,
         detected_at_seconds: now_seconds,
         active_goal: cursor.goal_status == "active",
@@ -784,12 +815,69 @@ fn apply_stop_hook_goal_context(state: &mut MonitorState) {
         let Some(cursor) = state.files.get(path) else {
             continue;
         };
+        if candidate.thread_source.is_empty() {
+            candidate.thread_source = cursor.thread_source.clone();
+        }
         if cursor.goal_status.is_empty() {
             continue;
         }
         candidate.latest_goal_status = cursor.goal_status.clone();
         if cursor.goal_status == "active" {
             candidate.active_goal = true;
+        }
+    }
+}
+
+fn filter_subagent_candidates(state: &mut MonitorState, summary: &mut WatchSummary) {
+    let pending_before = state.pending_completions.len();
+    state
+        .pending_completions
+        .retain(|candidate| candidate.thread_source != "subagent");
+    let confirming_before = state.confirming.len();
+    state
+        .confirming
+        .retain(|candidate| candidate.thread_source != "subagent");
+    summary.filtered_subagents += pending_before - state.pending_completions.len();
+    summary.filtered_subagents += confirming_before - state.confirming.len();
+}
+
+fn classify_unattributed_candidates(state: &mut MonitorState) {
+    let sources_by_turn = state
+        .files
+        .values()
+        .filter(|cursor| !cursor.thread_source.is_empty())
+        .flat_map(|cursor| {
+            cursor
+                .prompts
+                .iter()
+                .filter(|prompt| !prompt.turn_id.is_empty())
+                .map(|prompt| (prompt.turn_id.clone(), cursor.thread_source.clone()))
+        })
+        .fold(
+            BTreeMap::<String, String>::new(),
+            |mut sources, (turn, source)| {
+                let existing = sources.entry(turn).or_default();
+                // Parent prompts can be embedded into subagent rollouts. A prompt
+                // observed in a user rollout therefore takes precedence.
+                if existing.is_empty() || source == "user" {
+                    *existing = source;
+                }
+                sources
+            },
+        );
+
+    for candidate in &mut state.pending_completions {
+        if candidate.thread_source.is_empty()
+            && let Some(source) = sources_by_turn.get(&candidate.turn_id)
+        {
+            candidate.thread_source = source.clone();
+        }
+    }
+    for candidate in &mut state.confirming {
+        if candidate.thread_source.is_empty()
+            && let Some(source) = sources_by_turn.get(&candidate.turn_id)
+        {
+            candidate.thread_source = source.clone();
         }
     }
 }
@@ -1276,11 +1364,13 @@ fn migrate_state(state: &mut MonitorState) -> bool {
         for turn_id in state.completed_turns.clone() {
             add_bounded(&mut state.delivered_turns, turn_id, MAX_DELIVERED_TURNS);
         }
-        for cursor in state.files.values_mut() {
-            *cursor = FileCursor::default();
-        }
-        state.needs_initial_scan = true;
     }
+    // Version 2 learns the rollout source from its first session_meta record.
+    // Reset cursors once so already-open subagent/side threads are classified.
+    for cursor in state.files.values_mut() {
+        *cursor = FileCursor::default();
+    }
+    state.needs_initial_scan = true;
     state.version = MONITOR_STATE_VERSION;
     true
 }
@@ -1289,7 +1379,8 @@ fn migrate_state(state: &mut MonitorState) -> bool {
 mod tests {
     use super::{
         WATCH_INTERVAL, enqueue_completion, mark_turn_completed, monitor_state_path,
-        prepare_notifications, record_stop_fallback, session_day_directories, settle_delivery,
+        prepare_notifications, prepare_notifications_with_subagents, record_stop_fallback,
+        session_day_directories, settle_delivery,
     };
     use crate::codex::CompletionEvent;
     use crate::model::Outcome;
@@ -1356,6 +1447,15 @@ mod tests {
         )
     }
 
+    fn subagent_transcript_with_completion(now_seconds: u64) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"side-thread\",\"session_id\":\"parent-thread\",\"cwd\":\"/workspace\",\"thread_source\":\"subagent\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"parent-thread\"}}}}}}}}}}\n\
+             {{\"type\":\"session_meta\",\"payload\":{{\"id\":\"parent-thread\",\"cwd\":\"/workspace\",\"thread_source\":\"user\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"internal_chat_message_metadata_passthrough\":{{\"turn_id\":\"side-turn\"}},\"content\":[{{\"type\":\"input_text\",\"text\":\"Review in parallel\"}}]}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"side-turn\",\"completed_at\":{now_seconds},\"last_agent_message\":\"Review ready\"}}}}\n"
+        )
+    }
+
     fn transcript_with_aborted_turn(now_seconds: u64) -> String {
         format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"thread-1\",\"cwd\":\"/workspace\"}}}}\n\
@@ -1414,6 +1514,122 @@ mod tests {
         let (_, duplicate) =
             prepare_notifications(&paths, now + Duration::from_secs(2)).expect("deduplicated scan");
         assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn subagent_and_side_thread_completions_are_excluded_by_default() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(&transcript, subagent_transcript_with_completion(seconds))
+            .expect("write subagent transcript");
+
+        let (summary, deliveries) = prepare_notifications(&paths, now).expect("scan subagent");
+
+        assert_eq!(summary.new_completions, 1);
+        assert_eq!(summary.filtered_subagents, 1);
+        assert!(deliveries.is_empty());
+        let (_, later) = prepare_notifications(&paths, now + Duration::from_secs(10))
+            .expect("subagent remains filtered");
+        assert!(later.is_empty());
+    }
+
+    #[test]
+    fn subagent_notifications_can_be_explicitly_enabled() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(&transcript, subagent_transcript_with_completion(seconds))
+            .expect("write subagent transcript");
+        fs::write(
+            paths.session_index(),
+            "{\"id\":\"parent-thread\",\"thread_name\":\"Parent task\"}\n",
+        )
+        .expect("write title");
+
+        let (summary, deliveries) =
+            prepare_notifications_with_subagents(&paths, now, true).expect("scan subagent");
+
+        assert_eq!(summary.filtered_subagents, 0);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].notification.task, "Review in parallel");
+    }
+
+    #[test]
+    fn direct_notify_candidate_inherits_the_subagent_transcript_classification() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(&transcript, subagent_transcript_with_completion(seconds))
+            .expect("write subagent transcript");
+        let event = CompletionEvent {
+            event_type: "agent-turn-complete".to_owned(),
+            thread_id: "parent-thread".to_owned(),
+            turn_id: "side-turn".to_owned(),
+            cwd: "/workspace".to_owned(),
+            input_messages: vec!["Review in parallel".to_owned()],
+            last_assistant_message: "Review ready".to_owned(),
+        };
+        assert!(enqueue_completion(&paths, &event, now).expect("enqueue direct event"));
+
+        let (summary, deliveries) = prepare_notifications(&paths, now).expect("scan subagent");
+
+        assert_eq!(summary.filtered_subagents, 1);
+        assert!(deliveries.is_empty());
+    }
+
+    #[test]
+    fn direct_notify_is_filtered_from_the_subagent_prompt_before_completion_is_recorded() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"side-thread\",\"session_id\":\"parent-thread\",\"thread_source\":\"subagent\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"side-turn\"},\"content\":[{\"type\":\"input_text\",\"text\":\"Review in parallel\"}]}}\n"
+            ),
+        )
+        .expect("write in-progress subagent transcript");
+        let event = CompletionEvent {
+            event_type: "agent-turn-complete".to_owned(),
+            thread_id: "parent-thread".to_owned(),
+            turn_id: "side-turn".to_owned(),
+            cwd: "/workspace".to_owned(),
+            input_messages: vec!["Review in parallel".to_owned()],
+            last_assistant_message: "Review ready".to_owned(),
+        };
+        assert!(enqueue_completion(&paths, &event, now).expect("enqueue direct event"));
+
+        let (summary, deliveries) = prepare_notifications(&paths, now).expect("scan subagent");
+
+        assert_eq!(summary.filtered_subagents, 1);
+        assert!(deliveries.is_empty());
+    }
+
+    #[test]
+    fn subagent_interruption_candidates_are_excluded_by_default() {
+        let (_app_home, _codex_home, paths) = paths();
+        let (now, seconds) = timestamp();
+        let transcript = transcript_path(&paths, seconds);
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"side-thread\",\"thread_source\":\"subagent\"}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"internal_chat_message_metadata_passthrough\":{{\"turn_id\":\"side-error\"}},\"content\":[{{\"type\":\"input_text\",\"text\":\"Check failure\"}}]}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"side-error\",\"completed_at\":{seconds},\"error\":{{\"message\":\"stream disconnected\"}}}}}}\n"
+            ),
+        )
+        .expect("write interrupted subagent transcript");
+
+        let (summary, deliveries) = prepare_notifications(&paths, now).expect("scan interruption");
+
+        assert_eq!(summary.new_candidates, 1);
+        assert_eq!(summary.filtered_subagents, 1);
+        assert!(deliveries.is_empty());
+        let (_, later) = prepare_notifications(&paths, now + Duration::from_secs(60))
+            .expect("subagent interruption remains filtered");
+        assert!(later.is_empty());
     }
 
     #[test]
